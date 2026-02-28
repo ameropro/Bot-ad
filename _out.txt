@@ -1,0 +1,26 @@
+            task_type="subscribe",
+            subscribe_kind=task_type,
+            chat_type=task_type,
+        )
+        await state.set_state(CreateTaskState.channel)
+        kind_label = "канал" if task_type == "channel" else "чат"
+        prompt = (
+            f"Нажмите на кнопку, чтобы выбрать {kind_label}, который хотите продвигать.\n\n⚠️ Бот должен быть администратором канала/чата.\n\nВы можете выбрать:\n- 🏠 Свой {kind_label}, где вы администратор, тогда боту АВТОМАТИЧЕСКИ будут предоставлены права администратора на приглашение пользователей.\n- 🌐 Другой {kind_label}, где вы не администратор, тогда вам нужно будет предоставить боту права администратора вручную."
+            
+        )
+        await callback.message.answer(
+            prompt,
+            reply_markup=add_bot_admin_cancel_kb(task_type),
+        )
+        await callback.message.answer(
+            "\u2800",
+            reply_markup=chat_picker_kb(task_type),
+        )
+        await callback.answer()
+        return
+    await state.update_data(task_type=task_type)
+    if task_type in {"subscribe", "bot", "boost"}:
+        await state.set_state(CreateTaskState.channel)
+        if task_type == "bot":
+            prompt = "🤖 Отправьте @username бота или ссылку на него."
+        elif task_type == "boost":

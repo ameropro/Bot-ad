@@ -15,6 +15,7 @@ from utils import escape, format_coins, now_ts
 # Маппинг технических ошибок на понятные сообщения
 PERMISSION_ERROR_MESSAGES = {
     "not_member": "Бот был удалён из канала/чата",
+    "bot_removed": "Бот был удалён из канала/чата",
     "no_access": "Нет прав на доступ к информации о подписчиках",
     "no_admin": "Бот не является администратором в канале/чате",
     "channel_private": "Канал приватный и бот не имеет доступа",
@@ -512,16 +513,19 @@ async def subscription_watchdog(bot: Bot, db, config: Config) -> None:
                             claim.get("chat_id"), claim.get("chat_username")
                         )
                     keyboard = None
+                    buttons = []
                     if chat_link:
-                        keyboard = InlineKeyboardMarkup(
-                            inline_keyboard=[
-                                [
-                                    InlineKeyboardButton(
-                                        text="🔗 Подписаться обратно", url=chat_link
-                                    )
-                                ]
-                            ]
+                        buttons.append([
+                            InlineKeyboardButton(
+                                text="🔗 Подписаться обратно", url=chat_link
+                            )
+                        ])
+                    buttons.append([
+                        InlineKeyboardButton(
+                            text="📝 Подать апелляцию", callback_data=f"appeal:unsubscribe:{claim['id']}"
                         )
+                    ])
+                    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
                     try:
                         await bot.send_message(
                             claim["user_id"],
@@ -541,6 +545,9 @@ async def subscription_watchdog(bot: Bot, db, config: Config) -> None:
                         completed_at=now,
                     )
                     await db.return_task_funds(claim["task_id"], claim["reward"])
+                    task = await db.get_task(claim["task_id"])
+                    if task and task.get("task_status") not in {"blocked", "paused"}:
+                        await db.resume_task(task["id"])
                     await revoke_task_reward(
                         db,
                         config,
@@ -605,7 +612,12 @@ async def invoice_watchdog(bot: Bot, db, config: Config) -> None:
         await asyncio.sleep(INVOICE_CHECK_INTERVAL)
 
 
-async def check_bot_permissions(bot: Bot, chat_id: int, chat_username: str | None) -> dict:
+async def check_bot_permissions(
+    bot: Bot,
+    chat_id: int,
+    chat_username: str | None,
+    chat_type: str | None = None,
+) -> dict:
     """
     Проверяет конкретные права бота в чате/канале.
     Возвращает dict с результатом проверки.
@@ -614,7 +626,7 @@ async def check_bot_permissions(bot: Bot, chat_id: int, chat_username: str | Non
         "has_permissions": True,
         "missing_permissions": [],
         "bot_not_found": False,
-        "total_required_permissions": 4,
+        "total_required_permissions": 0,
     }
     
     # Требуемые права
@@ -629,33 +641,48 @@ async def check_bot_permissions(bot: Bot, chat_id: int, chat_username: str | Non
         # Извлекаем ID бота из токена (формат: bot_id:token_part)
         bot_id = int(bot.token.split(':')[0])
         member = await bot.get_chat_member(chat_id, bot_id)
+
+        # Если бот создатель – у него есть все права
+        if member.status == "creator":
+            return result
+
+        # Если бот не администратор – проблема прав
+        if member.status != "administrator":
+            result["missing_permissions"].append("Бот не является администратором")
+            result["has_permissions"] = False
+            result["total_required_permissions"] = 1
+            return result
         
         # Проверяем каждое требуемое право
+        checked_permissions = 0
         for permission_attr, permission_name in required_permissions.items():
-            if not getattr(member, permission_attr, False):
+            value = getattr(member, permission_attr, None)
+            if value is None:
+                continue
+            checked_permissions += 1
+            if not value:
                 result["missing_permissions"].append(permission_name)
         
+        result["total_required_permissions"] = checked_permissions or len(required_permissions)
         if result["missing_permissions"]:
             result["has_permissions"] = False
             
     except TelegramForbiddenError:
-        # Бот не имеет доступа к чату или был исключен
+        # Бот не имеет доступа к чату или был исключён
         result["bot_not_found"] = True
         result["has_permissions"] = False
     except TelegramBadRequest as e:
         error_str = str(e).lower()
-        if "not a member" in error_str:
+        if "not a member" in error_str or "chat not found" in error_str or "user not found" in error_str:
             # Бот не в чате
             result["bot_not_found"] = True
             result["has_permissions"] = False
-        elif "inaccessible" in error_str or "member list" in error_str:
-            # Просто не можем проверить - считаем что всё в порядке
-            result["has_permissions"] = True
         else:
-            # Другие ошибки - не считаем это потерей прав
-            result["has_permissions"] = True
+            # Не можем проверить – считаем проблемой прав
+            result["missing_permissions"].append("Нет доступа для проверки прав")
+            result["has_permissions"] = False
     except Exception as e:
-        # Неожиданная ошибка - не считаем это потерей прав
+        # Неожиданная ошибка – не считаем потерей прав
         print(f"[WARNING] check_bot_permissions: {e}")
         result["has_permissions"] = True
     
@@ -706,7 +733,7 @@ async def verify_task_for_resume(bot: Bot, task: dict) -> dict:
         }
     
     # Проверяем текущие права бота
-    perm_check = await check_bot_permissions(bot, chat_id, chat_username)
+    perm_check = await check_bot_permissions(bot, chat_id, chat_username, task.get("chat_type"))
     
     if perm_check["has_permissions"]:
         # Все права восстановлены - можно пересумировать
@@ -753,6 +780,7 @@ async def subscribe_task_watchdog(bot: Bot, db, config: Config) -> None:
     while True:
         try:
             tasks = await db.list_active_subscribe_tasks()
+            now = now_ts()
             
             for task in tasks:
                 chat_id = task.get("chat_id")
@@ -760,18 +788,32 @@ async def subscribe_task_watchdog(bot: Bot, db, config: Config) -> None:
                 owner_id = task.get("owner_id")
                 task_id = task.get("id")
                 current_status = task.get("task_status", "active")
+                status_changed_at = int(task.get("status_changed_at") or 0)
                 chat_type = task.get("chat_type", "").lower()
                 
                 if not chat_id:
                     continue
                 
-                # Пропускаем уже приостановленные задания
-                if current_status != "active":
+                should_check = False
+                if current_status == "active":
+                    should_check = True
+                elif current_status in ("no_permissions", "bot_removed"):
+                    if status_changed_at <= 0:
+                        await db.set_task_status(task_id, current_status, task.get("status_reason"))
+                        status_changed_at = now
+                    if now - status_changed_at <= 3600:
+                        should_check = True
+                else:
                     continue
                 
-                perm_check = await check_bot_permissions(bot, chat_id, chat_username)
+                if not should_check:
+                    continue
+                
+                perm_check = await check_bot_permissions(bot, chat_id, chat_username, chat_type)
                 
                 if not perm_check["has_permissions"]:
+                    if current_status != "active":
+                        continue
                     # Определяем ссылку для добавления бота заново в зависимости от типа чата
                     if chat_type == "channel":
                         add_bot_link = "https://t.me/adgramo_bot?startchannel&admin=post_messages+edit_messages+delete_messages+invite_users+manage_chat"
@@ -826,7 +868,6 @@ async def subscribe_task_watchdog(bot: Bot, db, config: Config) -> None:
                     except (TelegramBadRequest, TelegramForbiddenError):
                         pass
                 else:
-                    # Права восстановлены - активируем задание если оно было на паузе
                     if current_status in ("no_permissions", "bot_removed"):
                         await db.set_task_status(task_id, "active")
                         try:

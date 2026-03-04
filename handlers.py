@@ -29,6 +29,7 @@ from db import Database
 from services import (
     CryptoPayClient,
     build_topup_success_text,
+    check_bot_permissions,
     check_sponsors,
     ensure_user_achievements,
     format_achievements,
@@ -91,6 +92,7 @@ class AdminState(StatesGroup):
     admin_task_edit_title = State()
     admin_task_edit_reward = State()
     admin_task_edit_desc = State()
+    admin_task_block_reason = State()
     sponsor_action = State()
     sponsor_chat = State()
     sponsor_link = State()
@@ -111,6 +113,10 @@ class ReviewState(StatesGroup):
 
 class ManageTaskState(StatesGroup):
     amount = State()
+
+
+class AppealState(StatesGroup):
+    reason = State()
 
 
 def main_menu_kb(is_admin: bool) -> ReplyKeyboardMarkup:
@@ -349,6 +355,7 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
     builder.button(text="🎁 Промокоды", callback_data="admin:promo")
     builder.button(text="📋 Список промокодов", callback_data="admin:promo:list")
     builder.button(text="🗑 Удалить промокод", callback_data="admin:promo:delete")
+    builder.button(text="📝 Апелляции", callback_data="admin:appeals:page:1")
     builder.button(text="🤝 Спонсоры", callback_data="admin:sponsors")
     builder.button(text="📣 Рассылка", callback_data="admin:broadcast")
     builder.button(text="🔔 Уведомления", callback_data="admin:notify")
@@ -361,7 +368,7 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
     builder.button(text="🔓 Разбан", callback_data="admin:unblock")
     builder.button(text="🗂 Дамп базы", callback_data="admin:dump")
     builder.button(text="⬅️ Назад", callback_data="admin:back")
-    builder.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1)
+    builder.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1)
     return builder.as_markup()
 
 
@@ -1337,6 +1344,7 @@ router = Router()
 routers.append(router)
 
 OP_MAX_RULES = 5
+OP_BOT_LINK_MIN_WAIT = 15
 
 
 def parse_duration_strict(value: str) -> int | None:
@@ -1447,6 +1455,20 @@ async def cleanup_rule_if_needed(db: Database, rule: dict) -> bool:
     return False
 
 
+async def bot_link_wait_remaining(db: Database, rule_id: int, user_id: int) -> int | None:
+    row = await db.fetchone(
+        "SELECT passed_at FROM op_passes WHERE rule_id = ? AND user_id = ?",
+        (rule_id, user_id),
+    )
+    if not row:
+        return None
+    passed_at = int(row.get("passed_at") or 0)
+    wait_left = OP_BOT_LINK_MIN_WAIT - (now_ts() - passed_at)
+    if wait_left > 0:
+        return wait_left
+    return None
+
+
 async def check_rule(bot, db: Database, user_id: int, rule: dict) -> bool:
     if rule.get("type") == "bot_ref":
         user = await db.get_user(user_id)
@@ -1458,6 +1480,9 @@ async def check_rule(bot, db: Database, user_id: int, rule: dict) -> bool:
         )
         return bool(op_pass)
     if rule.get("type") == "bot_link":
+        wait_left = await bot_link_wait_remaining(db, rule["id"], user_id)
+        if wait_left is not None:
+            return False
         op_pass = await db.fetchone(
             "SELECT 1 FROM op_passes WHERE rule_id = ? AND user_id = ?",
             (rule["id"], user_id),
@@ -1681,11 +1706,12 @@ async def op_setup(message: Message, db: Database) -> None:
             expires_at=expires_at,
             target_count=None,
         )
+        target_label = "канала" if chat.type == "channel" else "чата"
         await send_with_autodelete(
             message.bot,
             db,
             message.chat.id,
-            f"✅ Проверка подключена. ID правила: <code>{rule_id}</code>",
+            f"✅ Проверка подключена для {target_label}. ID правила: <code>{rule_id}</code>",
         )
         return
 
@@ -1758,11 +1784,12 @@ async def op_setup(message: Message, db: Database) -> None:
         expires_at=expires_at,
         target_count=target_count,
     )
+    target_label = "канала" if chat.type == "channel" else "чата"
     await send_with_autodelete(
         message.bot,
         db,
         message.chat.id,
-        f"✅ Проверка подключена. ID правила: <code>{rule_id}</code>",
+        f"✅ Проверка подключена для {target_label}. ID правила: <code>{rule_id}</code>",
     )
 
 
@@ -2047,6 +2074,18 @@ async def op_check(callback: CallbackQuery, db: Database) -> None:
         return
     missing, _ = await evaluate_rules(callback.bot, db, chat_id, callback.from_user.id)
     if missing:
+        wait_left = None
+        for rule in missing:
+            if rule.get("type") == "bot_link":
+                wait = await bot_link_wait_remaining(db, rule["id"], callback.from_user.id)
+                if wait:
+                    wait_left = wait if wait_left is None else min(wait_left, wait)
+        if wait_left:
+            await callback.answer(
+                f"Перейдите по ссылке на бота и подождите {wait_left} сек.",
+                show_alert=True,
+            )
+            return
         await callback.answer("Подпишитесь на все каналы и попробуйте снова.", show_alert=True)
         return
     await callback.message.edit_text("✅ Подписка подтверждена. Доступ открыт.")
@@ -2072,7 +2111,8 @@ async def op_visit_bot(callback: CallbackQuery, db: Database) -> None:
     await db.mark_op_pass(rule_id, callback.from_user.id)
     await callback.answer("Переходите по ссылке 👇")
     await callback.message.edit_text(
-        "✅ Нажимайте на кнопку ниже для перехода на бота:",
+        "✅ Нажимайте на кнопку ниже для перехода на бота.\n"
+        f"После перехода подождите {OP_BOT_LINK_MIN_WAIT} сек и нажмите «Проверить».",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="🤖 Перейти на бота", url=link)]]
         ),
@@ -2081,9 +2121,9 @@ async def op_visit_bot(callback: CallbackQuery, db: Database) -> None:
 
 @router.message(F.chat.type.in_({"group", "supergroup"}))
 async def op_enforce(message: Message, db: Database) -> None:
-    if not message.from_user or message.from_user.is_bot:
+    if message.sender_chat and message.sender_chat.type == "channel":
         return
-    if message.text and message.text.startswith("/"):
+    if not message.from_user or message.from_user.is_bot:
         return
     if await is_chat_admin(message.bot, message.chat.id, message.from_user.id):
         return
@@ -2115,11 +2155,16 @@ TASK_TITLES = {
 
 
 USERNAME_RE = re.compile(r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]{5,32})", re.I)
+BOOST_RE = re.compile(
+    r"(?:https?://)?(?:t\.me|telegram\.me)/boost/([A-Za-z0-9_]{5,32})",
+    re.I,
+)
 AT_RE = re.compile(r"@([A-Za-z0-9_]{5,32})")
 PLAIN_RE = re.compile(r"^[A-Za-z0-9_]{5,32}$")
 REWARD_PAGE_SIZE = 10
 REWARD_TARGET_PAGE = 3
 REWARD_TARGET_OFFSET = REWARD_PAGE_SIZE * REWARD_TARGET_PAGE - 1
+APPEALS_PAGE_SIZE = 10
 
 MIN_REWARDS = {
     "channel": 600,
@@ -2132,6 +2177,9 @@ def extract_username(text: str) -> str | None:
     text = text.strip()
     if not text:
         return None
+    match = BOOST_RE.search(text)
+    if match:
+        return f"@{match.group(1)}"
     match = AT_RE.search(text)
     if match:
         return f"@{match.group(1)}"
@@ -2186,31 +2234,19 @@ async def build_reward_prompt(
     if not task_type:
         return "Введите награду в BIT:"
     min_reward = min_reward_for(task_type, chat_type, config)
-    chat_filter = chat_filter_for(task_type, chat_type)
-    threshold = await db.get_reward_threshold(task_type, REWARD_TARGET_OFFSET, chat_filter)
-    if threshold:
-        hint = (
-            "💡 Чтобы попасть на первые 3 страницы, "
-            f"укажите сумму от <b>{format_coins(threshold)}</b>."
-        )
-    else:
-        hint = (
-            "💡 Минимальная сумма для этой категории: "
-            f"<b>{format_coins(min_reward)}</b>."
-        )
-    commission_text = (
-        f"💸 Комиссия сервиса: <b>{config.commission_percent}%</b> от суммы задания."
-    )
-    free_text = "💡 Пополнение баланса: каждые 1$ отключают комиссию на 24 часа."
+    lines = [
+        "Введите награду в BIT:",
+        f"💡 Минимальная сумма для этой категории: <b>{format_coins(min_reward)}</b>.",
+        f"💸 Комиссия сервиса <b>{config.commission_percent}%</b> от суммы задания.",
+        "💡 Пополнение баланса: каждые 1$ отключают комиссию на 24 часа.",
+    ]
     if user_id is not None:
         user = await db.get_user(user_id)
         free_until = int(user.get("commission_free_until") or 0) if user else 0
         if free_until > now_ts():
             until_text = datetime.fromtimestamp(free_until).strftime("%d.%m.%Y %H:%M")
-            free_text = f"✅ Комиссия отключена до <b>{until_text}</b>."
-    return f"Введите награду в BIT:\n{hint}\n\n{commission_text}\n{free_text}"
-
-
+            lines.append(f"✅ Комиссия отключена до <b>{until_text}</b>.")
+    return "\n".join(lines)
 def calculate_commission_fee(total_cost: int, user: dict | None, config: Config) -> int:
     if total_cost <= 0 or not user:
         return 0
@@ -2424,12 +2460,31 @@ async def create_channel(
             )
             return
     if task_type == "boost":
+        # Если пользователь ввёл ссылку вида t.me/boost/имя_канала
+        boost_match = re.search(r"(?:https?://)?(?:t\.me|telegram\.me)/boost/([A-Za-z0-9_]{5,32})", chat_ref, re.I)
+        if boost_match:
+            username = boost_match.group(1)
+            chat_ref = f"@{username}"  # преобразуем в @username для дальнейшего получения chat
+
+        # Теперь получаем chat (как обычно)
+        try:
+            chat = await bot.get_chat(chat_ref)
+        except (TelegramBadRequest, TelegramForbiddenError):
+            await message.answer("Канал не найден или бот не имеет доступа.")
+            return
+
+        # Проверки
         if chat.type != "channel":
             await message.answer("Для бустов нужен канал.")
             return
         if not chat.username:
             await message.answer("Канал должен быть публичным с @username.")
             return
+
+    # ... остальной код (сохранение данных)
+
+
+
     await state.update_data(
         chat_id=chat.id,
         chat_type=normalize_chat_type(chat.type),
@@ -2702,18 +2757,23 @@ async def create_confirm(
     
     # Проверяем на дубликат задания
     duplicate = await db.check_task_duplicate(
-        chat_id=data.get("chat_id"),
-        chat_username=data.get("chat_username"),
-        source_message_id=data.get("source_message_id"),
-        owner_id=callback.from_user.id,
+    task_type=data.get("task_type"),
+    chat_id=data.get("chat_id"),
+    chat_username=data.get("chat_username"),
+    source_message_id=data.get("source_message_id"),
+    owner_id=callback.from_user.id,
     )
     if duplicate:
+        builder = InlineKeyboardBuilder()
+        builder.button(text="✏️ Редактировать", callback_data=f"adv:task:{duplicate['id']}:1")
+        builder.button(text="⬅️ Назад", callback_data="menu:ads")
+        builder.adjust(2)
         await callback.message.answer(
             f"⚠️ На этом канале/группе/посте уже существует задание!\n\n"
             f"ID существующего задания: <code>{duplicate['id']}</code>\n"
             f"Название: {escape(duplicate['title'])}\n\n"
             f"Вы не можете создавать несколько заданий на одном месте.",
-            reply_markup=main_menu_kb(callback.from_user.id in config.admin_ids),
+            reply_markup=builder.as_markup(),
         )
         await state.clear()
         await callback.answer()
@@ -2881,6 +2941,14 @@ def reaction_post_kb(url: str) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def reaction_post_appeal_kb(url: str, claim_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔗 Открыть пост", url=url)
+    builder.button(text="📝 Подать апелляцию", callback_data=f"appeal:task:{claim_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 def bot_intro_kb(task_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Подтвердить", callback_data=f"bot:confirm:{task_id}")
@@ -2892,6 +2960,28 @@ def bot_intro_kb(task_id: int) -> InlineKeyboardMarkup:
 def open_link_kb(url: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="🔗 Открыть", url=url)
+    return builder.as_markup()
+
+
+def go_link_kb(url: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Перейти", url=url)
+    return builder.as_markup()
+
+
+def open_link_appeal_kb(url: str, claim_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔗 Открыть", url=url)
+    builder.button(text="📝 Подать апелляцию", callback_data=f"appeal:task:{claim_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def revision_kb(url: str, claim_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔗 Перейти", url=url)
+    builder.button(text="Отправить скриншот", callback_data=f"revision:send:{claim_id}")
+    builder.adjust(1)
     return builder.as_markup()
 
 
@@ -2919,6 +3009,16 @@ def build_public_link(task: dict) -> str | None:
     if not username:
         return None
     return f"https://t.me/{username.lstrip('@')}"
+
+
+def build_task_action_link(task: dict) -> str | None:
+    task_type = task.get("type")
+    if task_type in {"view", "reaction"}:
+        return build_post_link(task)
+    link = task.get("action_link")
+    if link:
+        return link
+    return build_public_link(task)
 
 
 async def check_user_blocked(bot, db: Database, user_id: int) -> bool:
@@ -3046,9 +3146,10 @@ async def start_task_for_user(
             )
             return
         if task["type"] in {"reaction", "bot", "boost"}:
-            link = task.get("action_link")
-            if not link and task.get("chat_username"):
-                link = f"https://t.me/{task['chat_username'].lstrip('@')}"
+            if task["type"] == "reaction":
+                link = build_post_link(task)
+            else:
+                link = build_task_action_link(task)
             if not link:
                 await bot.send_message(chat_id, "Не удалось получить ссылку.")
                 return
@@ -3056,7 +3157,13 @@ async def start_task_for_user(
                 "✅ Задание уже начато, выполните задание и отправьте скриншот.\n"
                 f"Награда: <b>{format_coins(task['reward'])}</b>"
             )
-            await bot.send_message(chat_id, text, reply_markup=open_link_kb(link))
+            if task["type"] in {"reaction", "boost"}:
+                kb = open_link_appeal_kb(link, existing["id"])
+                if task["type"] == "reaction":
+                    kb = reaction_post_appeal_kb(link, existing["id"])
+            else:
+                kb = open_link_kb(link)
+            await bot.send_message(chat_id, text, reply_markup=kb)
             return
     if task["type"] == "bot":
         text = (
@@ -3121,8 +3228,25 @@ async def start_task_for_user(
         except (TelegramBadRequest, TelegramForbiddenError):
             await db.return_task_funds(task["id"], task["reward"])
             await db.update_claim(claim_id, status="rejected")
-            await bot.send_message(chat_id, "Не удалось переслать пост.")
+            # Блокируем задание с причиной
+            await db.set_task_status(task["id"], "blocked", "Пост был удалён")
+            try:
+                await bot.send_message(
+                    task["owner_id"],
+                    "🚫 Задание заблокировано.\n"
+                    "Причина: Пост был удалён.\n\n"
+                    "Если у Вас остались вопросы напишите нам @ameropro",
+                )
+            except (TelegramBadRequest, TelegramForbiddenError):
+                pass
+            await bot.send_message(
+                chat_id,
+                "⚠️ Задание неактуально.\n"
+                "Пост был удалён.\n\n"
+                "Если у Вас остались вопросы напишите нам @ameropro",
+            )
             return
+
         asyncio.create_task(
             complete_view_after_delay(bot, db, config, claim_id, task, user_id)
         )
@@ -3138,7 +3262,7 @@ async def start_task_for_user(
             chat_id,
             f"{TASK_ACTION_TEXT['reaction']}\n"
             f"Нужная реакция: <b>{escape(task['required_reaction'])}</b>",
-            reply_markup=reaction_post_kb(post_link),
+            reply_markup=reaction_post_appeal_kb(post_link, claim_id),
         )
         return
 
@@ -3149,10 +3273,13 @@ async def start_task_for_user(
             await bot.send_message(chat_id, "Не удалось получить ссылку.")
             return
         text = TASK_ACTION_TEXT.get(task["type"], "Выполните задание и отправьте скриншот.")
+        kb = open_link_kb(target_link)
+        if task["type"] == "boost":
+            kb = open_link_appeal_kb(target_link, claim_id)
         await bot.send_message(
             chat_id,
             text,
-            reply_markup=open_link_kb(target_link),
+            reply_markup=kb,
         )
 
 
@@ -3387,6 +3514,39 @@ async def check_subscribe(callback: CallbackQuery, db: Database, config: Config)
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("appeal:"))
+async def appeal_start(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
+    parts = callback.data.split(":")
+    if len(parts) < 3:
+        await callback.answer("Некорректная заявка.", show_alert=True)
+        return
+    try:
+        claim_id = int(parts[2])
+    except ValueError:
+        await callback.answer("Некорректная заявка.", show_alert=True)
+        return
+    claim = await db.get_claim_with_task(claim_id)
+    if not claim or claim["user_id"] != callback.from_user.id:
+        await callback.answer("Заявка не найдена.", show_alert=True)
+        return
+    task = await db.get_task(claim["task_id"])
+    link = build_task_action_link(task) if task else None
+    link_text = link or "Ссылка недоступна"
+    await state.set_state(AppealState.reason)
+    await state.update_data(
+        appeal_claim_id=claim_id,
+        appeal_task_id=claim["task_id"],
+        appeal_link=link,
+    )
+    await callback.message.answer(
+        "Вы уверены, что хотите пожаловаться?\n"
+        f"Ссылка: {link_text}\n"
+        "📝 Введите причину жалобы:",
+        reply_markup=cancel_kb(),
+    )
+    await callback.answer()
+
+
 @router.message(F.photo | F.document)
 async def reaction_proof(message: Message, db: Database) -> None:
     if await check_user_blocked(message.bot, db, message.from_user.id):
@@ -3570,15 +3730,96 @@ async def review_note(message: Message, state: FSMContext, db: Database) -> None
     await db.update_claim(claim_id, status="revision", review_note=note)
     await state.clear()
     try:
+        task = await db.get_task(task_id) if task_id else None
+        link = build_task_action_link(task) if task else None
+        text = (
+            f"Нужна доработка по заданию #{task_id}:\n\n"
+            f"<blockquote>{escape(note)}</blockquote>\n\n"
+            "Перейдите снова по ссылке и доработайте."
+        )
+        kb = revision_kb(link, claim_id) if link else None
         await message.bot.send_message(
             user_id,
-            f"Нужна доработка:\n{note}\n\nОтправьте новый скриншот.",
+            text,
+            reply_markup=kb,
+            parse_mode="HTML",
         )
     except (TelegramBadRequest, TelegramForbiddenError):
         pass
     if task_id:
         await send_next_reaction_claim(message.bot, db, task_id, message.from_user.id)
     await message.answer("Отправлено на доработку.")
+
+
+@router.callback_query(F.data.startswith("revision:send:"))
+async def revision_send(callback: CallbackQuery, db: Database) -> None:
+    try:
+        claim_id = int(callback.data.split(":")[2])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректная заявка.", show_alert=True)
+        return
+    claim = await db.get_claim_with_task(claim_id)
+    if not claim or claim["user_id"] != callback.from_user.id:
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    task = await db.get_task(claim["task_id"])
+    link = build_task_action_link(task) if task else None
+    if not link:
+        await callback.message.answer("Ссылка недоступна.")
+        await callback.answer()
+        return
+    await callback.message.answer(
+        "Пришлите скриншот выполнения доработки.",
+        reply_markup=go_link_kb(link),
+    )
+    await callback.answer()
+
+
+@router.message(AppealState.reason)
+async def appeal_reason(message: Message, state: FSMContext, db: Database, config: Config) -> None:
+    data = await state.get_data()
+    claim_id = data.get("appeal_claim_id")
+    task_id = data.get("appeal_task_id")
+    reason = (message.text or "").strip()
+    if not claim_id or not task_id:
+        await state.clear()
+        await message.answer("Сессия апелляции устарела.")
+        return
+    if not reason:
+        await message.answer("Введите причину жалобы.")
+        return
+    appeal_id = await db.create_appeal(
+        user_id=message.from_user.id,
+        task_id=int(task_id),
+        claim_id=int(claim_id),
+        reason=reason,
+    )
+    await state.clear()
+
+    task = await db.get_task(int(task_id))
+    link = data.get("appeal_link") or (build_task_action_link(task) if task else None)
+    type_label = TASK_TYPE_LABELS.get(task.get("type") if task else None, "Задание")
+    admin_text_lines = [
+        f"📝 Апелляция #{appeal_id}",
+        f"От: <code>{message.from_user.id}</code>",
+        f"Задание: <b>#{task_id}</b> ({escape(type_label)})",
+    ]
+    if link:
+        admin_text_lines.append(f"Ссылка: {link}")
+    admin_text_lines.append("")
+    admin_text_lines.append(f"Причина: {escape(reason)}")
+    admin_text = "\n".join(admin_text_lines)
+    for admin_id in config.admin_ids:
+        try:
+            await message.bot.send_message(admin_id, admin_text, parse_mode="HTML")
+        except (TelegramBadRequest, TelegramForbiddenError):
+            pass
+
+    await db.auto_block_task_if_needed(int(task_id))
+    await message.answer(
+        "✅ Апелляция отправлена. Спасибо!",
+        reply_markup=main_menu_kb(message.from_user.id in config.admin_ids),
+    )
 
 
 router = Router()
@@ -3654,7 +3895,7 @@ async def topup_start_cb(
         return
     await state.set_state(TopUpState.amount)
     await callback.message.answer(
-        "Введите сумму в BIT:\n💵 100 BIT = 0.01$\n\n⚠️Мин. Сумма в BIT 201",
+        "Введите сумму в BIT:\n💵 100 BIT = 0.005$\n\n⚠️Мин. Сумма в BIT 201",
         reply_markup=cancel_kb(),
     )
     await callback.answer()
@@ -4132,6 +4373,136 @@ async def admin_tops_completed(callback: CallbackQuery, db: Database, config: Co
     except TelegramBadRequest:
         await callback.message.answer(text, reply_markup=admin_tops_kb())
     await callback.answer()
+
+
+def _appeal_button_text(appeal: dict) -> str:
+    title = appeal.get("task_title") or "Без названия"
+    if len(title) > 24:
+        title = title[:21] + "..."
+    return f"#{appeal['id']} • {title}"
+
+
+async def show_appeals_page(
+    callback: CallbackQuery, db: Database, page: int
+) -> None:
+    total = await db.count_appeals("appeal")
+    if total == 0:
+        await callback.message.edit_text(
+            "📝 Апелляций нет.",
+            reply_markup=admin_menu_kb(),
+        )
+        return
+    total_pages = max(1, (total + APPEALS_PAGE_SIZE - 1) // APPEALS_PAGE_SIZE)
+    page = max(1, min(page, total_pages))
+    offset = (page - 1) * APPEALS_PAGE_SIZE
+    appeals = await db.list_appeals_paged("appeal", APPEALS_PAGE_SIZE, offset)
+    lines = [f"📝 <b>Апелляции</b> • стр. {page}/{total_pages}"]
+    for item in appeals:
+        lines.append(
+            f"#{item['id']} • <code>{item['user_id']}</code> • {escape(item.get('task_title') or 'Без названия')}"
+        )
+    builder = InlineKeyboardBuilder()
+    for item in appeals:
+        builder.button(
+            text=_appeal_button_text(item),
+            callback_data=f"admin:appeal:view:{item['id']}:{page}",
+        )
+    nav = []
+    if page > 1:
+        nav.append(
+            InlineKeyboardButton(
+                text="⬅️ Назад",
+                callback_data=f"admin:appeals:page:{page - 1}",
+            )
+        )
+    if page < total_pages:
+        nav.append(
+            InlineKeyboardButton(
+                text="➡️ Далее",
+                callback_data=f"admin:appeals:page:{page + 1}",
+            )
+        )
+    if nav:
+        builder.row(*nav)
+    builder.row(InlineKeyboardButton(text="↩️ Админ", callback_data="menu:admin"))
+    try:
+        await callback.message.edit_text("\n".join(lines), reply_markup=builder.as_markup())
+    except TelegramBadRequest:
+        await callback.message.answer("\n".join(lines), reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data.startswith("admin:appeals:page:"))
+async def admin_appeals_page(callback: CallbackQuery, db: Database, config: Config) -> None:
+    if not is_admin(callback.from_user.id, config):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        page = int(callback.data.split(":")[-1])
+    except ValueError:
+        page = 1
+    await show_appeals_page(callback, db, page)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:appeal:view:"))
+async def admin_appeal_view(callback: CallbackQuery, db: Database, config: Config) -> None:
+    if not is_admin(callback.from_user.id, config):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    if len(parts) < 5:
+        await callback.answer()
+        return
+    appeal_id = int(parts[3])
+    page = int(parts[4])
+    appeal = await db.get_appeal(appeal_id)
+    if not appeal:
+        await callback.answer("Апелляция не найдена.", show_alert=True)
+        return
+    created_at = appeal.get("created_at") or 0
+    created_text = datetime.fromtimestamp(int(created_at)).strftime("%Y-%m-%d %H:%M")
+    link = None
+    task = await db.get_task(appeal["task_id"]) if appeal.get("task_id") else None
+    if task:
+        link = build_task_action_link(task)
+    lines = [
+        f"📝 <b>Апелляция #{appeal['id']}</b>",
+        f"Пользователь: <code>{appeal['user_id']}</code>",
+        f"Задание: <code>{appeal['task_id']}</code>",
+        f"Заявка: <code>{appeal['claim_id']}</code>",
+        f"Тип: <b>{escape(appeal.get('task_type') or '-')}</b>",
+        f"Название: <b>{escape(appeal.get('task_title') or '-')}</b>",
+        f"Дата: <b>{created_text}</b>",
+        "",
+        f"Причина:\n{escape(appeal.get('reason') or '-')}",
+    ]
+    if link:
+        lines.append(f"\nСсылка: {link}")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Рассмотрено", callback_data=f"admin:appeal:done:{appeal_id}:{page}")
+    builder.button(text="⬅️ Назад", callback_data=f"admin:appeals:page:{page}")
+    builder.adjust(1)
+    try:
+        await callback.message.edit_text("\n".join(lines), reply_markup=builder.as_markup())
+    except TelegramBadRequest:
+        await callback.message.answer("\n".join(lines), reply_markup=builder.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:appeal:done:"))
+async def admin_appeal_done(callback: CallbackQuery, db: Database, config: Config) -> None:
+    if not is_admin(callback.from_user.id, config):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    if len(parts) < 5:
+        await callback.answer()
+        return
+    appeal_id = int(parts[3])
+    page = int(parts[4])
+    await db.update_appeal_status(appeal_id, "reviewed")
+    await callback.answer("Отмечено как рассмотрено.")
+    await show_appeals_page(callback, db, page)
 
 
 @router.callback_query(F.data == "admin:invoices")
@@ -4654,6 +5025,58 @@ async def admin_tasks_manage_start(callback: CallbackQuery, state: FSMContext, c
     await callback.message.answer("Введите ID пользователя для управления его заданиями:", reply_markup=cancel_kb())
     await callback.answer()
 
+@router.callback_query(F.data.startswith("admin:task:block:"))
+async def admin_task_block_start(callback: CallbackQuery, state: FSMContext, config: Config) -> None:
+    if not is_admin(callback.from_user.id, config):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    task_id = int(callback.data.split(":")[3])
+    await state.update_data(block_task_id=task_id)
+    await state.set_state(AdminState.admin_task_block_reason)
+    await callback.message.answer(
+        "🚫 Введите причину блокировки задания (она будет показана пользователю):",
+        reply_markup=cancel_kb()
+    )
+    await callback.answer()
+
+@router.message(AdminState.admin_task_block_reason)
+async def admin_task_block_reason(message: Message, state: FSMContext, db: Database, config: Config) -> None:
+    if not is_admin(message.from_user.id, config):
+        return
+    data = await state.get_data()
+    task_id = data.get("block_task_id")
+    reason = (message.text or "").strip()
+    if not reason:
+        await message.answer("Причина не может быть пустой.")
+        return
+
+    # Получаем задание
+    task = await db.get_task(task_id)
+    if not task:
+        await message.answer("Задание не найдено.")
+        await state.clear()
+        return
+
+    # Устанавливаем статус blocked и сохраняем причину
+    await db.set_task_status(task_id, "blocked", reason)
+
+    # Отправляем уведомление владельцу задания
+    try:
+        await message.bot.send_message(
+            task["owner_id"],
+            f"🚫 <b>Ваше задание #{task_id} заблокировано администратором.</b>\n\n"
+            f"Причина: {escape(reason)}\n\n"
+            f"Если у Вас остались вопросы, напишите нам @ameropro",
+            parse_mode="HTML"
+        )
+    except (TelegramBadRequest, TelegramForbiddenError):
+        pass
+
+    await message.answer(
+        f"✅ Задание #{task_id} заблокировано. Причина сохранена.",
+        reply_markup=admin_menu_kb()
+    )
+    await state.clear()
 
 @router.message(AdminState.admin_user_id)
 async def admin_tasks_list(message: Message, state: FSMContext, db: Database, config: Config) -> None:
@@ -5001,10 +5424,15 @@ async def admin_task_info(message: Message, state: FSMContext, db: Database, con
     completed = max(0, total - remaining)
     active = int(task.get("active") or 0)
     deleted = int(task.get("deleted") or 0)
+    task_status = task.get("task_status", "active")
     if deleted:
         status = "🗑 Удалено"
     elif remaining <= 0:
         status = "✅ Завершено"
+    elif task_status == "blocked":
+        status = "🚫 Заблокировано"
+    elif task_status in ("bot_removed", "no_permissions"):
+        status = "🚫 Проблема"
     elif active:
         status = "🟢 Активно"
     else:
@@ -5050,33 +5478,6 @@ async def admin_task_info(message: Message, state: FSMContext, db: Database, con
     builder.button(text="⬅️ Назад", callback_data="admin:back")
     builder.adjust(1)
     await message.answer("\n".join(lines), reply_markup=builder.as_markup())
-    await state.clear()
-    @router.callback_query(F.data.startswith("admin:task:edit:"))
-    async def admin_task_edit(callback: CallbackQuery, db: Database, config: Config) -> None:
-        if not is_admin(callback.from_user.id, config):
-            await callback.answer("Нет доступа.", show_alert=True)
-            return
-        task_id = int(callback.data.split(":")[-1])
-        task = await db.get_task(task_id)
-        if not task:
-            await callback.answer("Задание не найдено.", show_alert=True)
-            return
-        await callback.message.answer(f"Редактирование задания #{task_id} пока не реализовано.")
-        await callback.answer()
-
-    @router.callback_query(F.data.startswith("admin:task:block:"))
-    async def admin_task_block(callback: CallbackQuery, db: Database, config: Config) -> None:
-        if not is_admin(callback.from_user.id, config):
-            await callback.answer("Нет доступа.", show_alert=True)
-            return
-        task_id = int(callback.data.split(":")[-1])
-        task = await db.get_task(task_id)
-        if not task:
-            await callback.answer("Задание не найдено.", show_alert=True)
-            return
-        await db.update_task_status(task_id, active=False)
-        await callback.message.answer(f"Задание #{task_id} заблокировано.")
-        await callback.answer()
     await state.clear()
 
 
@@ -5418,6 +5819,15 @@ def _adv_short_title(title: str, limit: int = 28) -> str:
     return title[: limit - 1] + "…"
 
 
+def blocked_task_text(reason: str | None) -> str:
+    reason_text = reason or "Заблокировано администратором"
+    return (
+        "🚫 <b>Задание заблокировано</b>\n"
+        f"Причина: {escape(reason_text)}\n\n"
+        "Если у Вас остались вопросы напишите нам @ameropro"
+    )
+
+
 def advertiser_tasks_kb(
     tasks: list[dict], page: int, total_pages: int
 ) -> InlineKeyboardMarkup:
@@ -5426,8 +5836,13 @@ def advertiser_tasks_kb(
         title = _adv_short_title(task["title"])
         remaining = int(task.get("remaining_count") or 0)
         active = int(task.get("active") or 0)
+        task_status = task.get("task_status", "active")
         if remaining <= 0:
             status = "✅"
+        elif task_status == "blocked":
+            status = "🚫"
+        elif task_status in ("bot_removed", "no_permissions"):
+            status = "⚠️"
         elif active:
             status = "🟢"
         else:
@@ -5470,15 +5885,24 @@ def advertiser_task_kb(task: dict, page: int, has_permission_error: bool = False
         builder.button(text="📥 Заявки", callback_data=f"review:queue:{task['id']}")
     remaining = int(task.get("remaining_count") or 0)
     active = int(task.get("active") or 0)
+    task_status = task.get("task_status", "active")
+    is_blocked = task_status == "blocked"
+    is_permission_error = has_permission_error or (
+        task.get("type") == "subscribe" and task_status in ("bot_removed", "no_permissions")
+    )
     
     # Если есть ошибка прав доступа, показываем кнопку добавления бота
-    if has_permission_error and task.get("type") == "subscribe":
+    if is_blocked:
+        # Заблокировано админом/системой — только навигация
+        pass
+    elif is_permission_error and task.get("type") == "subscribe":
         chat_type = task.get("chat_type", "").lower()
         if chat_type == "channel":
             add_bot_link = "https://t.me/adgramo_bot?startchannel&admin=post_messages+edit_messages+delete_messages+invite_users"
         else:
             add_bot_link = "https://t.me/adgramo_bot?startgroup&admin=post_messages+edit_messages+delete_messages+invite_users"
         builder.button(text="➕ Добавить бота", url=add_bot_link)
+        builder.button(text="🔄 Проверить права", callback_data=f"adv:check_rights:{task['id']}:{page}")
     else:
         if remaining > 0 and active:
             builder.button(text="⏸ Остановить", callback_data=f"adv:stop:{task['id']}:{page}")
@@ -5511,9 +5935,14 @@ async def adv_stop(callback: CallbackQuery, db: Database, config: Config) -> Non
     if not task:
         await callback.answer("Задание не найдено.", show_alert=True)
         return
+
+    task_status = task.get("task_status", "active")
+    if task_status == "blocked" and callback.from_user.id not in config.admin_ids:
+        await callback.message.answer(blocked_task_text(task.get("status_reason")), parse_mode="HTML")
+        await callback.answer()
+        return
     
     # Проверяем статус задания на подписку
-    task_status = task.get("task_status", "active")
     has_permission_error = task.get("type") == "subscribe" and task_status in ("bot_removed", "no_permissions")
     
     # Всегда останавливаем задание
@@ -5554,6 +5983,10 @@ async def adv_resume(callback: CallbackQuery, db: Database, config: Config, bot:
     if not task:
         await callback.answer("Задание не найдено.", show_alert=True)
         return
+    if task.get("task_status") == "blocked" and callback.from_user.id not in config.admin_ids:
+        await callback.message.answer(blocked_task_text(task.get("status_reason")), parse_mode="HTML")
+        await callback.answer()
+        return
     if int(task.get("remaining_count") or 0) <= 0:
         await callback.answer("Нет оставшихся выполнений.", show_alert=True)
         return
@@ -5591,6 +6024,52 @@ async def adv_resume(callback: CallbackQuery, db: Database, config: Config, bot:
     await show_advertiser_tasks_page(callback, db, page)
 
 
+@router.callback_query(F.data.startswith("adv:check_rights:"))
+async def adv_check_rights(callback: CallbackQuery, db: Database, config: Config, bot: Bot) -> None:
+    task_id, page = _parse_adv_manage(callback.data)
+    if callback.from_user.id in config.admin_ids:
+        task = await db.get_task(task_id)
+    else:
+        task = await db.get_owner_task(callback.from_user.id, task_id)
+    if not task:
+        await callback.answer("Задание не найдено.", show_alert=True)
+        return
+    if task.get("type") != "subscribe":
+        await callback.answer("Проверка прав доступна только для подписки.", show_alert=True)
+        return
+    chat_id = task.get("chat_id")
+    if not chat_id:
+        await callback.answer("Не удалось проверить права.", show_alert=True)
+        return
+    chat_type = (task.get("chat_type") or "").lower()
+    perm_check = await check_bot_permissions(
+        bot, chat_id, task.get("chat_username"), chat_type
+    )
+    if perm_check["has_permissions"]:
+        await db.set_task_status(task_id, "active")
+        await callback.message.answer("✅ Права бота восстановлены. Задание активировано.")
+        await show_advertiser_tasks_page(callback, db, page)
+        await callback.answer()
+        return
+    missing_count = len(perm_check["missing_permissions"])
+    total_required = perm_check.get("total_required_permissions", 5)
+    if perm_check["bot_not_found"] or missing_count == total_required:
+        status = "bot_removed"
+        reason = "bot_removed"
+        problem_text = "Бот был удалён из канала/чата."
+    else:
+        status = "no_permissions"
+        reason = ", ".join(perm_check["missing_permissions"]) or "неизвестно"
+        problem_text = "Бот потерял некоторые права:\n• " + reason
+    await db.set_task_status(task_id, status, reason)
+    await callback.message.answer(
+        f"🚫 Проблема с доступом.\n{problem_text}\n\n"
+        "После исправления нажмите «Возобновить» или «Проверить права» ещё раз."
+    )
+    await show_advertiser_tasks_page(callback, db, page)
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("adv:delete:"))
 async def adv_delete(callback: CallbackQuery, db: Database, config: Config) -> None:
     task_id, page = _parse_adv_manage(callback.data)
@@ -5600,6 +6079,10 @@ async def adv_delete(callback: CallbackQuery, db: Database, config: Config) -> N
         task = await db.get_owner_task(callback.from_user.id, task_id)
     if not task:
         await callback.answer("Задание не найдено.", show_alert=True)
+        return
+    if task.get("task_status") == "blocked" and callback.from_user.id not in config.admin_ids:
+        await callback.message.answer(blocked_task_text(task.get("status_reason")), parse_mode="HTML")
+        await callback.answer()
         return
     
     # Проверяем статус задания на подписку - если потеряны права, блокируем удаление (кроме админов)
@@ -5647,6 +6130,10 @@ async def adv_add(callback: CallbackQuery, state: FSMContext, db: Database, conf
     if not task:
         await callback.answer("Задание не найдено.", show_alert=True)
         return
+    if task.get("task_status") == "blocked" and callback.from_user.id not in config.admin_ids:
+        await callback.message.answer(blocked_task_text(task.get("status_reason")), parse_mode="HTML")
+        await callback.answer()
+        return
     
     # Проверяем статус задания на подписку - если потеряны права, блокируем пополнение (кроме админов)
     task_status = task.get("task_status", "active")
@@ -5685,6 +6172,10 @@ async def adv_reduce(callback: CallbackQuery, state: FSMContext, db: Database, c
         task = await db.get_owner_task(callback.from_user.id, task_id)
     if not task:
         await callback.answer("Задание не найдено.", show_alert=True)
+        return
+    if task.get("task_status") == "blocked" and callback.from_user.id not in config.admin_ids:
+        await callback.message.answer(blocked_task_text(task.get("status_reason")), parse_mode="HTML")
+        await callback.answer()
         return
     
     # Проверяем статус задания на подписку - если потеряны права, блокируем уменьшение (кроме админов)
@@ -5744,14 +6235,24 @@ async def adv_manage_amount(
         await message.answer("Задание не найдено.")
         return
     if action == "add":
-        cost = await db.add_task_quantity(message.from_user.id, int(task_id), amount)
+        user = await db.get_user(message.from_user.id)
+        total_cost = amount * int(task.get("reward") or 0)
+        commission_fee = calculate_commission_fee(total_cost, user, config)
+        cost = await db.add_task_quantity(
+            message.from_user.id, int(task_id), amount, commission_fee=commission_fee
+        )
         if cost is None:
             await message.answer("Недостаточно BIT для пополнения.")
             return
         await state.clear()
-        await message.answer(
-            f"✅ Пополнено на {amount}. Списано {format_coins(cost)} BIT."
-        )
+        if commission_fee:
+            text = (
+                f"✅ Пополнено на {amount}. Списано {format_coins(cost)} BIT "
+                f"(комиссия {format_coins(commission_fee)} BIT)."
+            )
+        else:
+            text = f"✅ Пополнено на {amount}. Списано {format_coins(cost)} BIT."
+        await message.answer(text)
     else:
         remaining = int(task.get("remaining_count") or 0)
         if amount > remaining:
@@ -5861,8 +6362,13 @@ async def adv_task(callback: CallbackQuery, db: Database) -> None:
     spent = int(task["total_count"]) * int(task["reward"]) - int(task["escrow_balance"])
     remaining = int(task.get("remaining_count") or 0)
     active = int(task.get("active") or 0)
+    task_status = task.get("task_status", "active")
     if remaining <= 0:
         status = "✅ Завершено"
+    elif task_status == "blocked":
+        status = "🚫 Заблокировано"
+    elif task_status in ("bot_removed", "no_permissions"):
+        status = "🚫 Проблема"
     elif active:
         status = "🟢 Активно"
     else:
@@ -5887,13 +6393,15 @@ async def adv_task(callback: CallbackQuery, db: Database) -> None:
         f"Зачтено: <b>{stats['completed']}</b>"
     )
     
-    # Проверяем на ошибки прав доступа
-    task_status = task.get("task_status", "active")
+    # Проверяем на ошибки прав доступа / блокировку
     has_permission_error = (
         task.get("type") == "subscribe" and task_status in ("bot_removed", "no_permissions")
     )
+    is_blocked = task_status == "blocked"
     
-    if has_permission_error:
+    if is_blocked:
+        text += "\n\n" + blocked_task_text(task.get("status_reason"))
+    elif has_permission_error:
         human_reason = format_permission_error(task.get("status_reason"))
         text += f"\n\n🚫 <b>Проблема: У бота не хватает прав</b>\n{human_reason}\n\n После добавления бота, сообщите в тех. поддержку @ameropro."
     

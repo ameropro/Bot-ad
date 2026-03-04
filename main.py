@@ -9,6 +9,8 @@ from config import Config
 from db import Database
 from handlers import BlockedUserMiddleware, CallbackAntiFloodMiddleware, MessageAntiFloodMiddleware, routers
 from services import start_background_tasks
+from permissions_handlers import router as permissions_router
+from bot_permissions_watchdog_advanced import bot_permissions_watchdog_advanced
 
 
 async def main() -> None:
@@ -31,7 +33,11 @@ async def main() -> None:
     dp.callback_query.middleware(CallbackAntiFloodMiddleware(limit=0.7))
     for router in routers:
         dp.include_router(router)
+    dp.include_router(permissions_router)
+    
     tasks = await start_background_tasks(bot, db, config)
+    asyncio.create_task(bot_permissions_watchdog_advanced(bot, db, config))
+    
     try:
         await dp.start_polling(bot)
     finally:

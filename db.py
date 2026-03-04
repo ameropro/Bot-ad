@@ -52,7 +52,10 @@ class Database:
                 deleted INTEGER NOT NULL DEFAULT 0,
                 total_count INTEGER NOT NULL,
                 remaining_count INTEGER NOT NULL,
-                escrow_balance INTEGER NOT NULL
+                escrow_balance INTEGER NOT NULL,
+                task_status TEXT DEFAULT 'active',
+                status_reason TEXT,
+                status_changed_at INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS task_claims (
@@ -173,9 +176,20 @@ class Database:
                 setting_value TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS appeals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                task_id INTEGER NOT NULL,
+                claim_id INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'appeal',
+                created_at INTEGER NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_task_claims_status ON task_claims(status);
             CREATE INDEX IF NOT EXISTS idx_tasks_active ON tasks(active, type);
             CREATE INDEX IF NOT EXISTS idx_op_rules_chat ON op_rules(chat_id, active);
+            CREATE INDEX IF NOT EXISTS idx_appeals_status ON appeals(status);
             """
         )
         await self._ensure_columns()
@@ -202,6 +216,10 @@ class Database:
         if "status_reason" not in columns:
             await self._conn.execute(
                 "ALTER TABLE tasks ADD COLUMN status_reason TEXT"
+            )
+        if "status_changed_at" not in columns:
+            await self._conn.execute(
+                "ALTER TABLE tasks ADD COLUMN status_changed_at INTEGER NOT NULL DEFAULT 0"
             )
         cursor = await self._conn.execute("PRAGMA table_info(users)")
         rows = await cursor.fetchall()
@@ -582,7 +600,7 @@ class Database:
         )
         return cursor.rowcount > 0
 
-    async def add_task_quantity(self, owner_id: int, task_id: int, amount: int) -> Optional[int]:
+    async def add_task_quantity(self, owner_id: int, task_id: int, amount: int, commission_fee: int = 0) -> Optional[int]:
         if not self._conn:
             raise RuntimeError("Database is not initialized")
         await self._conn.execute("BEGIN")
@@ -596,15 +614,16 @@ class Database:
             return None
         reward = int(task["reward"])
         total_cost = reward * amount
+        total_charge = total_cost + commission_fee
         balance_row = await self._conn.execute("SELECT balance FROM users WHERE id = ?", (owner_id,))
         balance_data = await balance_row.fetchone()
         balance = int(balance_data["balance"]) if balance_data else 0
-        if balance < total_cost:
+        if balance < total_charge:
             await self._conn.execute("ROLLBACK")
             return None
         await self._conn.execute(
             "UPDATE users SET balance = balance - ? WHERE id = ?",
-            (total_cost, owner_id),
+            (total_charge, owner_id),
         )
         await self._conn.execute(
             """
@@ -619,6 +638,20 @@ class Database:
                 now_ts(),
             ),
         )
+        if commission_fee and commission_fee > 0:
+            await self._conn.execute(
+                """
+                INSERT INTO transactions (user_id, amount, reason, meta, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    owner_id,
+                    -commission_fee,
+                    "task_fee",
+                    json.dumps({"fee": commission_fee}, ensure_ascii=False),
+                    now_ts(),
+                ),
+            )
         await self._conn.execute(
             """
             UPDATE tasks
@@ -689,7 +722,7 @@ class Database:
             raise RuntimeError("Database is not initialized")
         await self._conn.execute("BEGIN")
         task_row = await self._conn.execute(
-            "SELECT reward, remaining_count, total_count, owner_id FROM tasks WHERE id = ? AND deleted = 0",
+            "SELECT reward, remaining_count, total_count, owner_id FROM tasks WHERE id = ? AND owner_id = ? AND deleted = 0",
             (task_id, owner_id),
         )
         task = await task_row.fetchone()
@@ -760,15 +793,35 @@ class Database:
             (reason, task_id),
         )
 
+    async def set_task_active(self, task_id: int, active: bool) -> None:
+        if active:
+            await self.execute(
+                """
+                UPDATE tasks
+                SET active = 1, task_status = 'active', status_reason = NULL
+                WHERE id = ?
+                """,
+                (task_id,),
+            )
+        else:
+            await self.execute(
+                """
+                UPDATE tasks
+                SET active = 0, task_status = 'paused', status_reason = 'Приостановлено администратором'
+                WHERE id = ?
+                """,
+                (task_id,),
+            )
+
     async def set_task_status(self, task_id: int, status: str, reason: str | None = None) -> None:
         active = 1 if status == "active" else 0
         await self.execute(
             """
             UPDATE tasks
-            SET active = ?, task_status = ?, status_reason = ?
+            SET active = ?, task_status = ?, status_reason = ?, status_changed_at = ?
             WHERE id = ?
             """,
-            (active, status, reason, task_id),
+            (active, status, reason, now_ts(), task_id),
         )
 
     async def get_owner_subscribe_task(self, owner_id: int, chat_id: int) -> Optional[dict]:
@@ -1222,8 +1275,8 @@ class Database:
     async def list_active_subscribe_tasks(self) -> list[dict]:
         return await self.fetchall(
             """
-            SELECT id, owner_id, chat_id, chat_username, chat_title, task_status, 
-                   status_reason, active
+            SELECT id, owner_id, chat_id, chat_username, chat_title, chat_type, task_status, 
+                   status_reason, status_changed_at, active
             FROM tasks
             WHERE type = 'subscribe' AND deleted = 0
             """,
@@ -1361,7 +1414,7 @@ class Database:
             JOIN tasks t ON t.id = c.task_id
             WHERE t.type = 'subscribe'
               AND t.chat_type = 'channel'
-              AND c.status IN ('completed', 'completed_hold')
+              AND c.status IN ('completed', 'completed_hold', 'revoked')
             """,
             (),
         )
@@ -1372,7 +1425,7 @@ class Database:
             JOIN tasks t ON t.id = c.task_id
             WHERE t.type = 'subscribe'
               AND (t.chat_type IS NULL OR t.chat_type != 'channel')
-              AND c.status IN ('completed', 'completed_hold')
+              AND c.status IN ('completed', 'completed_hold', 'revoked')
             """,
             (),
         )
@@ -1382,7 +1435,7 @@ class Database:
             FROM task_claims c
             JOIN tasks t ON t.id = c.task_id
             WHERE t.type = 'view'
-              AND c.status IN ('completed', 'completed_hold')
+              AND c.status IN ('completed', 'completed_hold', 'revoked')
             """,
             (),
         )
@@ -1392,7 +1445,7 @@ class Database:
             FROM task_claims c
             JOIN tasks t ON t.id = c.task_id
             WHERE t.type = 'reaction'
-              AND c.status IN ('completed', 'completed_hold')
+              AND c.status IN ('completed', 'completed_hold', 'revoked')
             """,
             (),
         )
@@ -1657,39 +1710,146 @@ class Database:
         return True, None
 
     async def check_task_duplicate(
-        self, chat_id: Optional[int], chat_username: Optional[str], source_message_id: Optional[int], owner_id: int
+        self,
+        task_type: str | None,
+        chat_id: Optional[int],
+        chat_username: Optional[str],
+        source_message_id: Optional[int],
+        owner_id: int,
     ) -> Optional[dict]:
         """
-        Проверяет, существует ли уже задание на этом чате/посте.
-        Возвращает существующее задание или None.
+        Checks whether a task already exists for the same target (chat or post).
+        Returns the existing task or None.
         """
         if not self._conn:
             raise RuntimeError("Database is not initialized")
-        
-        # Для subscribe задач проверяем по chat_id и owner_id
-        if chat_id:
+
+        # If the task type is unknown, fall back to the legacy behavior.
+        if not task_type:
+            if chat_id:
+                row = await self.fetchone(
+                    """
+                    SELECT * FROM tasks
+                    WHERE chat_id = ? AND owner_id = ? AND deleted = 0 AND type = 'subscribe'
+                    LIMIT 1
+                    """,
+                    (chat_id, owner_id),
+                )
+                if row:
+                    return row
+            if source_message_id:
+                row = await self.fetchone(
+                    """
+                    SELECT * FROM tasks
+                    WHERE source_message_id = ? AND owner_id = ? AND deleted = 0
+                    LIMIT 1
+                    """,
+                    (source_message_id, owner_id),
+                )
+                if row:
+                    return row
+            return None
+
+        # For subscribe/boost tasks, check by chat_id and type.
+        if task_type in {"subscribe", "boost"} and chat_id:
             row = await self.fetchone(
                 """
                 SELECT * FROM tasks
-                WHERE chat_id = ? AND owner_id = ? AND deleted = 0 AND type = 'subscribe'
+                WHERE chat_id = ? AND owner_id = ? AND deleted = 0 AND type = ?
                 LIMIT 1
                 """,
-                (chat_id, owner_id),
+                (chat_id, owner_id, task_type),
             )
             if row:
                 return row
-        
-        # Для channel/group задач проверяем по source_message_id и owner_id
-        if source_message_id:
+
+        # For post tasks (view/reaction), check by source_message_id and type.
+        if task_type in {"view", "reaction"} and source_message_id:
             row = await self.fetchone(
                 """
                 SELECT * FROM tasks
-                WHERE source_message_id = ? AND owner_id = ? AND deleted = 0
+                WHERE source_message_id = ? AND owner_id = ? AND deleted = 0 AND type = ?
                 LIMIT 1
                 """,
-                (source_message_id, owner_id),
+                (source_message_id, owner_id, task_type),
             )
             if row:
                 return row
-        
+
         return None
+
+    async def count_task_appeals(self, task_id: int) -> int:
+        """Подсчитывает количество жалоб на задание"""
+        result = await self.fetchone(
+            "SELECT COUNT(*) as cnt FROM appeals WHERE task_id = ? AND status = 'appeal'",
+            (task_id,)
+        )
+        return result.get("cnt", 0) if result else 0
+
+    async def auto_block_task_if_needed(self, task_id: int) -> bool:
+        """
+        Проверяет количество жалоб на задание.
+        Если жалоб >= 5, автоматически блокирует задание.
+        Возвращает True если задание было заблокировано.
+        """
+        appeal_count = await self.count_task_appeals(task_id)
+        
+        if appeal_count >= 5:
+            task = await self.get_task(task_id)
+            if task and task.get("task_status") != "blocked":
+                await self.set_task_status(task_id, "blocked", f"Автоблокировка: {appeal_count} жалоб на задание")
+                return True
+        
+        return False
+
+    async def create_appeal(
+        self, user_id: int, task_id: int, claim_id: int, reason: str
+    ) -> int:
+        cursor = await self.execute(
+            """
+            INSERT INTO appeals (user_id, task_id, claim_id, reason, status, created_at)
+            VALUES (?, ?, ?, ?, 'appeal', ?)
+            """,
+            (user_id, task_id, claim_id, reason, now_ts()),
+        )
+        return int(cursor.lastrowid or 0)
+
+    async def get_appeal(self, appeal_id: int) -> Optional[dict]:
+        return await self.fetchone(
+            """
+            SELECT a.*, t.title as task_title, t.type as task_type,
+                   t.chat_id, t.chat_username, t.source_message_id, t.action_link
+            FROM appeals a
+            LEFT JOIN tasks t ON t.id = a.task_id
+            WHERE a.id = ?
+            """,
+            (appeal_id,),
+        )
+
+    async def count_appeals(self, status: str = "appeal") -> int:
+        row = await self.fetchone(
+            "SELECT COUNT(*) as cnt FROM appeals WHERE status = ?",
+            (status,),
+        )
+        return int(row["cnt"]) if row else 0
+
+    async def list_appeals_paged(
+        self, status: str, limit: int, offset: int
+    ) -> list[dict]:
+        return await self.fetchall(
+            """
+            SELECT a.*, t.title as task_title, t.type as task_type
+            FROM appeals a
+            LEFT JOIN tasks t ON t.id = a.task_id
+            WHERE a.status = ?
+            ORDER BY a.created_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (status, limit, offset),
+        )
+
+    async def update_appeal_status(self, appeal_id: int, status: str) -> None:
+        await self.execute(
+            "UPDATE appeals SET status = ? WHERE id = ?",
+            (status, appeal_id),
+        )

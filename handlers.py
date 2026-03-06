@@ -376,8 +376,9 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
     builder.button(text="⛔️ Бан", callback_data="admin:block")
     builder.button(text="🔓 Разбан", callback_data="admin:unblock")
     builder.button(text="🗂 Дамп базы", callback_data="admin:dump")
+    builder.button(text="💾 Бэкап bot.db", callback_data="admin:db:backup")
     builder.button(text="⬅️ Назад", callback_data="admin:back")
-    builder.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1)
+    builder.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2)
     return builder.as_markup()
 
 
@@ -5759,6 +5760,30 @@ async def admin_dump(callback: CallbackQuery, db: Database, config: Config) -> N
         FSInputFile(str(dump_path)),
         caption=f"📦 Дамп базы: {len(user_ids)} пользователей",
     )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:db:backup")
+async def admin_db_backup(callback: CallbackQuery, db: Database, config: Config) -> None:
+    if not is_admin(callback.from_user.id, config):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = Path("backups") / f"bot_backup_{stamp}.db"
+    try:
+        await db.export_backup(str(backup_path))
+        await callback.message.answer_document(
+            FSInputFile(str(backup_path)),
+            caption=f"💾 Полный бэкап БД ({backup_path.name})",
+        )
+    except Exception:
+        await callback.message.answer("Не удалось сформировать бэкап БД.")
+    finally:
+        try:
+            if backup_path.exists():
+                backup_path.unlink()
+        except OSError:
+            pass
     await callback.answer()
 
 

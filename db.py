@@ -1,4 +1,8 @@
 import json
+import os
+import shutil
+import time
+from datetime import datetime
 from typing import Any, Optional
 
 import aiosqlite
@@ -12,10 +16,14 @@ class Database:
         self._conn: Optional[aiosqlite.Connection] = None
 
     async def init(self) -> None:
+        await self._init_once(recover_on_malformed=True)
+
+    async def _init_once(self, recover_on_malformed: bool) -> None:
         self._conn = await aiosqlite.connect(self._path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA foreign_keys = ON")
-        await self._conn.executescript(
+        try:
+            await self._conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY,
@@ -191,9 +199,66 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_op_rules_chat ON op_rules(chat_id, active);
             CREATE INDEX IF NOT EXISTS idx_appeals_status ON appeals(status);
             """
-        )
-        await self._ensure_columns()
-        await self._conn.commit()
+            )
+            await self._ensure_columns()
+            await self._conn.commit()
+        except Exception as exc:
+            if recover_on_malformed and self._is_malformed_error(exc):
+                await self.close()
+                self._conn = None
+                backup_path = self._backup_malformed_db()
+                if not backup_path:
+                    raise RuntimeError(
+                        "База данных повреждена, но файл занят другим процессом. "
+                        "Остановите все процессы бота и запустите снова."
+                    ) from exc
+                print(
+                    f"[WARNING] Обнаружена повреждённая БД: {self._path}. "
+                    f"Сохранена копия: {backup_path}. Создаю новую БД."
+                )
+                await self._init_once(recover_on_malformed=False)
+                return
+            await self.close()
+            self._conn = None
+            raise
+
+    @staticmethod
+    def _is_malformed_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return "database disk image is malformed" in message or "malformed" in message
+
+    def _backup_malformed_db(self) -> str | None:
+        if not os.path.exists(self._path):
+            return None
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = f"{self._path}.corrupt_{stamp}.bak"
+
+        # На Windows файл может удерживаться немного дольше после закрытия соединения.
+        for _ in range(8):
+            try:
+                os.replace(self._path, backup_path)
+                return backup_path
+            except PermissionError:
+                time.sleep(0.15)
+            except OSError:
+                break
+
+        # Если переименовать не удалось, пробуем как минимум сохранить копию.
+        try:
+            shutil.copy2(self._path, backup_path)
+        except OSError:
+            return None
+
+        # Без удаления старого файла создать новую БД по тому же пути нельзя.
+        for _ in range(8):
+            try:
+                os.remove(self._path)
+                return backup_path
+            except PermissionError:
+                time.sleep(0.15)
+            except OSError:
+                return None
+        return None
 
     async def _ensure_columns(self) -> None:
         if not self._conn:
@@ -232,6 +297,23 @@ class Database:
     async def close(self) -> None:
         if self._conn:
             await self._conn.close()
+
+    async def export_backup(self, backup_path: str) -> None:
+        if not self._conn:
+            raise RuntimeError("Database is not initialized")
+        backup_dir = os.path.dirname(backup_path)
+        if backup_dir:
+            os.makedirs(backup_dir, exist_ok=True)
+        if os.path.exists(backup_path):
+            os.remove(backup_path)
+        target = await aiosqlite.connect(backup_path)
+        try:
+            # Force WAL pages to main DB before backup for a self-contained file.
+            await self._conn.execute("PRAGMA wal_checkpoint(FULL)")
+            await self._conn.backup(target)
+            await target.commit()
+        finally:
+            await target.close()
 
     async def execute(self, query: str, params: tuple = ()) -> aiosqlite.Cursor:
         if not self._conn:

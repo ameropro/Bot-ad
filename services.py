@@ -16,8 +16,8 @@ from utils import escape, format_coins, now_ts
 PERMISSION_ERROR_MESSAGES = {
     "not_member": "Бот был удалён из канала/чата",
     "bot_removed": "Бот был удалён из канала/чата",
-    "no_access": "Нет прав на доступ к информации о подписчиках",
-    "no_admin": "Бот не является администратором в канале/чате",
+    "no_access": "У бота нет права «Приглашение пользователей»",
+    "no_admin": "Бот не является администратором в этом чате",
     "channel_private": "Канал приватный и бот не имеет доступа",
     "user_not_member": "Бот не видит членов канала",
     "timeout": "Ошибка соединения с Telegram (тайм-аут)",
@@ -631,10 +631,7 @@ async def check_bot_permissions(
     
     # Требуемые права
     required_permissions = {
-        "can_post_messages": "Постить сообщения",
-        "can_edit_messages": "Редактировать сообщения",
-        "can_delete_messages": "Удалять сообщения",
-        "can_invite_users": "Приглашать пользователей",
+        "can_invite_users": "Приглашение пользователей",
     }
     
     try:
@@ -648,7 +645,7 @@ async def check_bot_permissions(
 
         # Если бот не администратор – проблема прав
         if member.status != "administrator":
-            result["missing_permissions"].append("Бот не является администратором")
+            result["missing_permissions"].append("Бот не является администратором в этом чате")
             result["has_permissions"] = False
             result["total_required_permissions"] = 1
             return result
@@ -740,7 +737,7 @@ async def verify_task_for_resume(bot: Bot, task: dict) -> dict:
         return {
             "can_resume": True,
             "problems_fixed": True,
-            "human_message": "✅ Проблемы решены! Права бота восстановлены.",
+            "human_message": "✅ Проблема решена! Право бота на приглашение пользователей восстановлено.",
             "human_action": None,
         }
     else:
@@ -767,8 +764,8 @@ async def verify_task_for_resume(bot: Bot, task: dict) -> dict:
             return {
                 "can_resume": False,
                 "problems_fixed": False,
-                "human_message": f"⚠️ Бот всё ещё потерял права:\n• {missing}",
-                "human_action": f"Выдайте боту права или добавьте его заново: <a href=\"{add_bot_link}\">Добавить бота</a>",
+                "human_message": f"⚠️ У бота всё ещё нет нужного права:\n• {missing}",
+                "human_action": f"Выдайте боту право «Приглашение пользователей» или добавьте его заново: <a href=\"{add_bot_link}\">Добавить бота</a>",
             }
 
 
@@ -820,12 +817,8 @@ async def subscribe_task_watchdog(bot: Bot, db, config: Config) -> None:
                     else:
                         add_bot_link = "https://t.me/adgramo_bot?startgroup&admin=post_messages+edit_messages+delete_messages+invite_users+manage_chat"
                     
-                    # Проверяем сколько прав пропало
-                    missing_count = len(perm_check["missing_permissions"])
-                    total_required = perm_check.get("total_required_permissions", 5)
-                    
-                    if perm_check["bot_not_found"] or missing_count == total_required:
-                        # Все права пропали или бот удален - объединяем оба случая
+                    if perm_check["bot_not_found"]:
+                        # Бот удален из чата или недоступен
                         await db.set_task_status(
                             task_id, 
                             "bot_removed",
@@ -834,13 +827,13 @@ async def subscribe_task_watchdog(bot: Bot, db, config: Config) -> None:
                         message = (
                             f"❌ <b>Задание приостановлено!</b>\n\n"
                             f"Задание: <b>{task.get('chat_title', 'Неизвестный чат')}</b>\n\n"
-                            f"<b>Проблема:</b> Бот был удалён или у него пропали все права\n\n"
+                            f"<b>Проблема:</b> Бот был удалён из чата или не является администратором\n\n"
                             f"<b>Что делать:</b> Добавьте бота заново по ссылке:\n"
                             f"<a href=\"{add_bot_link}\">Добавить бота</a>\n\n"
                             f"После добавления нажмите «Возобновить»"
                         )
                     else:
-                        # Только часть прав пропала
+                        # Бот есть в чате, но нет нужного права
                         missing = ", ".join(perm_check["missing_permissions"]) or "неизвестно"
                         await db.set_task_status(
                             task_id,
@@ -850,10 +843,10 @@ async def subscribe_task_watchdog(bot: Bot, db, config: Config) -> None:
                         message = (
                             f"⚠️ <b>Задание приостановлено!</b>\n\n"
                             f"Задание: <b>{task.get('chat_title', 'Неизвестный чат')}</b>\n\n"
-                            f"<b>Проблема:</b> Бот потерял некоторые права:\n"
+                            f"<b>Проблема:</b> У бота нет права «Приглашение пользователей»:\n"
                             f"• {missing}\n\n"
-                            f"<b>Что делать:</b> Вариант 1 - выдайте боту необходимые права в администраторских настройках\n\n"
-                            f"Вариант 2 - удалите и добавьте бота заново с правами:\n"
+                            f"<b>Что делать:</b> Вариант 1 — выдайте право «Приглашение пользователей»\n\n"
+                            f"Вариант 2 — удалите и добавьте бота заново:\n"
                             f"<a href=\"{add_bot_link}\">Добавить бота заново</a>\n\n"
                             f"После этого нажмите «Возобновить»"
                         )
@@ -874,7 +867,7 @@ async def subscribe_task_watchdog(bot: Bot, db, config: Config) -> None:
                             await bot.send_message(
                                 owner_id,
                                 f"✅ <b>Задание возобновлено!</b>\n\n"
-                                f"Права бота восстановлены. Задание вернулось в активные.",
+                                f"Право «Приглашение пользователей» восстановлено. Задание вернулось в активные.",
                                 parse_mode="HTML"
                             )
                         except (TelegramBadRequest, TelegramForbiddenError):

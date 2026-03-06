@@ -213,13 +213,19 @@ INVITE_RIGHTS = ChatAdministratorRights(
     can_delete_stories=False,
 )
 
+OWN_CHANNEL_REQUEST_ID = 101
+OTHER_CHANNEL_REQUEST_ID = 102
+OWN_GROUP_REQUEST_ID = 201
+OTHER_GROUP_REQUEST_ID = 202
+OTHER_CHAT_REQUEST_IDS = {OTHER_CHANNEL_REQUEST_ID, OTHER_GROUP_REQUEST_ID}
+
 
 def chat_picker_kb(kind: str) -> ReplyKeyboardMarkup:
     is_channel = kind == "channel"
     own_text = "✅ Выбрать свой канал" if is_channel else "✅ Выбрать свой чат"
     other_text = "📌 Выберите другой канал" if is_channel else "📌 Выберите другой чат"
-    own_request_id = 101 if is_channel else 201
-    other_request_id = 102 if is_channel else 202
+    own_request_id = OWN_CHANNEL_REQUEST_ID if is_channel else OWN_GROUP_REQUEST_ID
+    other_request_id = OTHER_CHANNEL_REQUEST_ID if is_channel else OTHER_GROUP_REQUEST_ID
     builder = ReplyKeyboardBuilder()
     builder.add(
         KeyboardButton(
@@ -228,6 +234,7 @@ def chat_picker_kb(kind: str) -> ReplyKeyboardMarkup:
                 request_id=own_request_id,
                 chat_is_channel=is_channel,
                 user_administrator_rights=INVITE_RIGHTS,
+                bot_administrator_rights=INVITE_RIGHTS,
             ),
         )
     )
@@ -435,12 +442,14 @@ def add_bot_admin_help_text(kind: str | None = None, missing_access: bool = True
     link = add_bot_admin_url(kind)
     if missing_access:
         return (
-            "Чат не найден или бот не имеет доступа. Перейдите или дайте "
-            f"<a href=\"{link}\">ссылку</a> администратору, чтобы бота добавили в канал/чат."
+            "❌ Чат не найден или бот не имеет доступа к этому чату.\n\n"
+            "Нажмите кнопку ниже, чтобы добавить бота с нужными правами.\n"
+            f"Если вы не можете сделать это сами, передайте <a href=\"{link}\">эту ссылку</a> администратору чата."
         )
     return (
-        "В этом чате/канале нет бота. Передайте "
-        f"<a href=\"{link}\">ссылку</a> администратору, чтобы бота добавили в канал/чат."
+        "❌ Бот не является администратором в этом чате!\n\n"
+        "Нажмите кнопку ниже, чтобы добавить бота с нужными правами.\n"
+        f"Если вы не можете сделать это сами, передайте <a href=\"{link}\">эту ссылку</a> администратору чата."
     )
 
 
@@ -562,7 +571,7 @@ HELP_MENU_TEXT = (
 TIPS_TEXT = (
     "💡 <b>Подсказки</b>\n\n"
     "1) Пополняйте баланс заранее, чтобы задания запускались без задержек.\n"
-    "2) Если бот не видит канал — добавьте его администратором."
+    "2) Если бот не видит канал — дайте ему право «Приглашение пользователей»."
 )
 
 FAQ_CONTENT = {
@@ -594,24 +603,25 @@ FAQ_CONTENT = {
 
 OP_PUBLIC_TEXT = (
     "✅Функция проверки подписки на канал/чат\n\n"
-    "▸ Шаг 1. Добавьте бота в ваш чат с правами администратора. (Можно с помощью этой ссылки "
-    "(http://t.me/adgramo_bot?startgroup&admin=post_messages+edit_messages+delete_messages+invite_users+manage_chat))\n"
-    "▸ Шаг 2. Добавьте бота в администраторы канала/чата, на который хотите установить проверку подписки.\n"
-    "Вы можете передать эту ссылку (http://t.me/adgramo_bot?startchannel&admin=post_messages+edit_messages+delete_messages+invite_users+manage_chat) "
-    "администратору канала/чата.\n"
+    "▸ Шаг 1. Добавьте бота в ваш чат с правом «Приглашение пользователей». "
+    "Можно через <a href=\"https://t.me/adgramo_bot?startgroup&admin=post_messages+edit_messages+delete_messages+invite_users+manage_chat\">эту ссылку</a>.\n"
+    "▸ Шаг 2. Добавьте бота в администраторы канала/чата, на который хотите установить проверку подписки, "
+    "и оставьте право «Приглашение пользователей».\n"
+    "Если нужно, передайте администратору канала/чата "
+    "<a href=\"https://t.me/adgramo_bot?startchannel&admin=post_messages+edit_messages+delete_messages+invite_users+manage_chat\">эту ссылку</a>.\n"
     "Шаг 3: Чтобы включить подписку на канал/чат, напишите в вашем чате команду:\n"
-    "/setup ссылка\n\n"
+    "<code>/setup ссылка</code>\n\n"
     "⛔️ Чтобы отключить функцию, вам нужно:\n"
     "▸ Написать команду:\n"
-    "/unsetup @channel - отключить канал/чат\n"
-    "Пример: /unsetup @rove\n\n"
+    "<code>/unsetup @channel</code> - отключить канал/чат\n"
+    "Пример: <code>/unsetup @rove</code>\n\n"
     "➕Максимальное количество одновременной проверки - 5 каналов/чатов\n"
     "❌ Для отключения сразу всех установленных проверок на подписки используйте команду /unsetup\n\n"
-    "💡 Напишите команду /status в вашем чате, чтобы получить перечень активных проверок на подписку, "
+    "💡 Напишите команду <code>/status</code> в вашем чате, чтобы получить перечень активных проверок на подписку, "
     "а также информацию о времени действия каждой проверки и ее отмене.\n\n"
     "🕒 Дополнительно вы можете установить таймер для автоматического отключения проверки подписки.\n"
     "пример:\n"
-    "/setup @rove 1d\n"
+    "<code>/setup @rove 1d</code>\n"
     "Время можно указать в секундах, минутах, часах и днях.\n"
     "s - секунд\n"
     "m - минут\n"
@@ -668,20 +678,20 @@ OP_REFERRAL_TEXT = (
     "• 🎁 +10% – от суммы пополнений вашими рефералами\n"
     "• 👨‍💻 +3% до +15% – от выполнения заданий вашими рефералами (в зависимости от вашего уровня)\n\n"
     "Как настроить проверку подписки:\n"
-    "▸ Шаг 1: Добавьте бота в ваш чат с правами администратора. (Можно с помощью этой ссылки "
-    "(http://t.me/adgramo_bot?startgroup&admin=post_messages+edit_messages+delete_messages+invite_users+manage_chat))\n"
+    "▸ Шаг 1: Добавьте бота в ваш чат с правом «Приглашение пользователей». "
+    "Можно через <a href=\"https://t.me/adgramo_bot?startgroup&admin=post_messages+edit_messages+delete_messages+invite_users+manage_chat\">эту ссылку</a>.\n"
     "▸ Шаг 2: Чтобы включить проверку подписки на вашу реферальную ссылку, напишите в вашем чате команду:\n"
-    "/setup <ваш_ID> [период]\n"
+    "<code>/setup &lt;ваш_ID&gt; [период]</code>\n"
     "ID - используйте ваш ID (можно найти в «Мой кабинет»)\n\n"
     "Пример:\n"
-    "/setup 7193701006\n\n"
+    "<code>/setup 7193701006</code>\n\n"
     "⛔️ Чтобы отключить проверку, вам нужно написать команду:\n"
-    "/unsetup bot\n\n"
-    "💡 Напишите команду /status в вашем чате, чтобы получить список активных проверок на подписку, "
+    "<code>/unsetup bot</code>\n\n"
+    "💡 Напишите команду <code>/status</code> в вашем чате, чтобы получить список активных проверок на подписку, "
     "а также информацию о времени действия каждой проверки и её отмене.\n\n"
     "🕒 Дополнительно вы можете установить таймер для автоматического отключения проверки подписки.\n"
     "Пример:\n"
-    "/setup 7193701006 1d\n"
+    "<code>/setup 7193701006 1d</code>\n"
     "Время можно указать в секундах, минутах, часах и днях.\n"
     "s - секунд\n"
     "m - минут\n"
@@ -1090,7 +1100,7 @@ async def menu_op_message(message: Message, state: FSMContext, db: Database) -> 
     await state.clear()
     if not await ensure_sponsors(message.bot, message.from_user.id, db):
         return
-    await message.answer(escape(OP_PUBLIC_TEXT), reply_markup=op_menu_kb())
+    await message.answer(OP_PUBLIC_TEXT, reply_markup=op_menu_kb())
 
 
 @router.message(F.text.in_(["📊 Статистика", "Статистика"]))
@@ -1267,7 +1277,7 @@ async def menu_op(callback: CallbackQuery, state: FSMContext, db: Database) -> N
     if not await ensure_sponsors(callback.bot, callback.from_user.id, db):
         await callback.answer()
         return
-    await callback.message.answer(escape(OP_PUBLIC_TEXT), reply_markup=op_menu_kb())
+    await callback.message.answer(OP_PUBLIC_TEXT, reply_markup=op_menu_kb())
     await callback.answer()
 
 
@@ -1276,7 +1286,7 @@ async def op_menu_back(callback: CallbackQuery, db: Database) -> None:
     if not await ensure_sponsors(callback.bot, callback.from_user.id, db):
         await callback.answer()
         return
-    await callback.message.edit_text(escape(OP_PUBLIC_TEXT), reply_markup=op_menu_kb())
+    await callback.message.edit_text(OP_PUBLIC_TEXT, reply_markup=op_menu_kb())
     await callback.answer()
 
 
@@ -1285,7 +1295,7 @@ async def op_public(callback: CallbackQuery, db: Database) -> None:
     if not await ensure_sponsors(callback.bot, callback.from_user.id, db):
         await callback.answer()
         return
-    await callback.message.edit_text(escape(OP_PUBLIC_TEXT), reply_markup=op_back_kb())
+    await callback.message.edit_text(OP_PUBLIC_TEXT, reply_markup=op_back_kb())
     await callback.answer()
 
 
@@ -1312,7 +1322,7 @@ async def op_ref(callback: CallbackQuery, db: Database) -> None:
     if not await ensure_sponsors(callback.bot, callback.from_user.id, db):
         await callback.answer()
         return
-    await callback.message.edit_text(escape(OP_REFERRAL_TEXT), reply_markup=op_back_kb())
+    await callback.message.edit_text(OP_REFERRAL_TEXT, reply_markup=op_back_kb())
     await callback.answer()
 
 
@@ -2347,10 +2357,10 @@ async def create_choose_type(callback: CallbackQuery, state: FSMContext) -> None
         kind_label = "канал" if task_type == "channel" else "чат"
         prompt = (
             f"Нажмите на кнопку, чтобы выбрать {kind_label}, который хотите продвигать.\n\n"
-            "⚠️ Бот должен быть администратором канала/чата.\n\n"
+            "⚠️ У бота должно быть право «Приглашение пользователей».\n\n"
             "Вы можете выбрать:\n"
-            f"- 🏠 Свой {kind_label}, где вы администратор, тогда боту АВТОМАТИЧЕСКИ будут предоставлены права администратора на приглашение пользователей.\n"
-            f"- 🌐 Другой {kind_label}, где вы не администратор, тогда вам нужно будет предоставить боту права администратора вручную."
+            f"- 🏠 Свой {kind_label}, где вы администратор: бот добавится автоматически с правом «Приглашение пользователей».\n"
+            f"- 🌐 Другой {kind_label}, где вы не администратор: попросите администратора добавить бота и выдать право «Приглашение пользователей»."
         )
         await callback.message.answer(
             prompt,
@@ -2364,7 +2374,10 @@ async def create_choose_type(callback: CallbackQuery, state: FSMContext) -> None
         if task_type == "boost":
             prompt = "⚡️ Отправьте @username канала для буста."
         else:
-            prompt = "📣 Отправьте @username или ссылку на канал/группу.\nБот должен быть админом."
+            prompt = (
+                "📣 Отправьте @username или ссылку на канал/группу.\n"
+                "У бота должно быть право «Приглашение пользователей»."
+            )
         reply = add_bot_admin_cancel_kb("group") if task_type == "subscribe" else cancel_kb()
         await callback.message.answer(prompt, reply_markup=reply)
     else:
@@ -2442,6 +2455,13 @@ async def create_channel(
                 reply_markup=add_bot_admin_cancel_kb(subscribe_kind),
             )
             return
+        if bot_member.status == "administrator" and not getattr(bot_member, "can_invite_users", False):
+            await message.answer(
+                "❌ У бота нет права «Приглашение пользователей».\n\n"
+                "Выдайте боту это право и попробуйте снова.",
+                reply_markup=add_bot_admin_cancel_kb(subscribe_kind),
+            )
+            return
         existing_task = await db.get_owner_subscribe_task(message.from_user.id, chat.id)
         if existing_task:
             await message.answer(
@@ -2510,6 +2530,8 @@ async def create_channel_shared(
     if task_type != "subscribe":
         await message.answer("Отправьте ссылку или @username.")
         return
+    request_id = message.chat_shared.request_id
+    is_other_chat_pick = request_id in OTHER_CHAT_REQUEST_IDS
     chat_id = message.chat_shared.chat_id
     try:
         chat = await bot.get_chat(chat_id)
@@ -2517,7 +2539,10 @@ async def create_channel_shared(
         bot_member = await bot.get_chat_member(chat.id, bot_user.id)
     except (TelegramBadRequest, TelegramForbiddenError):
         await message.answer(
-            add_bot_admin_help_text(subscribe_kind, missing_access=True),
+            add_bot_admin_help_text(
+                subscribe_kind,
+                missing_access=not is_other_chat_pick,
+            ),
             reply_markup=add_bot_admin_cancel_kb(subscribe_kind),
         )
         return
@@ -2533,6 +2558,13 @@ async def create_channel_shared(
     if bot_member.status not in {"administrator", "creator"}:
         await message.answer(
             add_bot_admin_help_text(subscribe_kind, missing_access=False),
+            reply_markup=add_bot_admin_cancel_kb(subscribe_kind),
+        )
+        return
+    if bot_member.status == "administrator" and not getattr(bot_member, "can_invite_users", False):
+        await message.answer(
+            "❌ У бота нет права «Приглашение пользователей».\n\n"
+            "Выдайте боту это право и попробуйте снова.",
             reply_markup=add_bot_admin_cancel_kb(subscribe_kind),
         )
         return
@@ -5962,7 +5994,7 @@ async def adv_stop(callback: CallbackQuery, db: Database, config: Config) -> Non
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="➕ Добавить бота", url=add_bot_link)]])
         await callback.message.answer(
             f"⏸ <b>Задание остановлено</b>\n\n"
-            f"⚠️ <b>Проблема: У бота не хватает прав</b>\n"
+            f"⚠️ <b>Проблема: Нет права «Приглашение пользователей»</b>\n"
             f"{human_reason}\n\n"
             f"<b>Монеты заморожены</b> в этом задании.",
             reply_markup=kb
@@ -6051,16 +6083,14 @@ async def adv_check_rights(callback: CallbackQuery, db: Database, config: Config
         await show_advertiser_tasks_page(callback, db, page)
         await callback.answer()
         return
-    missing_count = len(perm_check["missing_permissions"])
-    total_required = perm_check.get("total_required_permissions", 5)
-    if perm_check["bot_not_found"] or missing_count == total_required:
+    if perm_check["bot_not_found"]:
         status = "bot_removed"
         reason = "bot_removed"
         problem_text = "Бот был удалён из канала/чата."
     else:
         status = "no_permissions"
         reason = ", ".join(perm_check["missing_permissions"]) or "неизвестно"
-        problem_text = "Бот потерял некоторые права:\n• " + reason
+        problem_text = "У бота нет нужного права:\n• " + reason
     await db.set_task_status(task_id, status, reason)
     await callback.message.answer(
         f"🚫 Проблема с доступом.\n{problem_text}\n\n"
@@ -6099,7 +6129,7 @@ async def adv_delete(callback: CallbackQuery, db: Database, config: Config) -> N
         
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="➕ Добавить бота", url=add_bot_link)]])
         await callback.message.answer(
-            f"🚫 <b>Проблема: У бота не хватает прав</b>\n\n"
+            f"🚫 <b>Проблема: Нет права «Приглашение пользователей»</b>\n\n"
             f"{human_reason}\n\n"
             f"<b>Монеты заморожены</b> в этом задании.",
             reply_markup=kb
@@ -6403,7 +6433,10 @@ async def adv_task(callback: CallbackQuery, db: Database) -> None:
         text += "\n\n" + blocked_task_text(task.get("status_reason"))
     elif has_permission_error:
         human_reason = format_permission_error(task.get("status_reason"))
-        text += f"\n\n🚫 <b>Проблема: У бота не хватает прав</b>\n{human_reason}\n\n После добавления бота, сообщите в тех. поддержку @ameropro."
+        text += (
+            "\n\n🚫 <b>Проблема: Нет права «Приглашение пользователей»</b>\n"
+            f"{human_reason}\n\nПосле добавления бота, сообщите в тех. поддержку @ameropro."
+        )
     
     await callback.message.edit_text(text, reply_markup=advertiser_task_kb(task, page, has_permission_error))
     await callback.answer()

@@ -93,6 +93,7 @@ class AdminState(StatesGroup):
     admin_task_edit_reward = State()
     admin_task_edit_desc = State()
     admin_task_block_reason = State()
+    admin_create_task_owner = State()
     sponsor_action = State()
     sponsor_chat = State()
     sponsor_link = State()
@@ -356,6 +357,7 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
     builder.button(text="📊 Статистика", callback_data="admin:stats")
     builder.button(text="🏆 Топы", callback_data="admin:tops")
     builder.button(text="📋 Управление заданиями", callback_data="admin:tasks:manage")
+    builder.button(text="📝 Создать задание от пользователя", callback_data="admin:create:as_user")
     builder.button(text="👤 Пользователь", callback_data="admin:user")
     builder.button(text="💰 Начислить", callback_data="admin:credit")
     builder.button(text="💸 Списать", callback_data="admin:debit")
@@ -2314,17 +2316,39 @@ def task_type_menu() -> InlineKeyboardBuilder:
     return builder
 
 
-async def start_create_flow(bot: Bot, user_id: int, state: FSMContext, db: Database) -> None:
+def resolve_create_owner_id(actor_id: int, state_data: dict, config: Config) -> int:
+    if actor_id not in config.admin_ids:
+        return actor_id
+    raw_owner_id = state_data.get("create_owner_id")
+    try:
+        return int(raw_owner_id) if raw_owner_id is not None else actor_id
+    except (TypeError, ValueError):
+        return actor_id
+
+
+async def start_create_flow(
+    bot: Bot,
+    user_id: int,
+    state: FSMContext,
+    db: Database,
+    owner_id: int | None = None,
+) -> None:
     if not await ensure_sponsors(bot, user_id, db):
         return
     await state.clear()
+    effective_owner_id = owner_id if owner_id is not None else user_id
+    await state.update_data(create_owner_id=effective_owner_id)
     await state.set_state(CreateTaskState.choose_type)
-    user = await db.get_user(user_id)
+    user = await db.get_user(effective_owner_id)
     balance = int(user["balance"]) if user else 0
+    owner_hint = ""
+    if effective_owner_id != user_id:
+        owner_hint = f"\n👤 Владелец задания: <code>{effective_owner_id}</code>"
     await bot.send_message(
         user_id,
         "📢 Что вы хотите рекламировать?\n"
-        f"💳 Баланс: {format_coins(balance)} BIT",
+        f"💳 Баланс: {format_coins(balance)} BIT"
+        f"{owner_hint}",
         reply_markup=task_type_menu().as_markup(),
     )
 
@@ -2394,6 +2418,7 @@ async def create_channel(
     message: Message, state: FSMContext, bot: Bot, db: Database, config: Config
 ) -> None:
     data = await state.get_data()
+    owner_id = resolve_create_owner_id(message.from_user.id, data, config)
     task_type = data.get("task_type")
     subscribe_kind = data.get("subscribe_kind")
     if task_type == "bot":
@@ -2462,7 +2487,7 @@ async def create_channel(
                 reply_markup=add_bot_admin_cancel_kb(subscribe_kind),
             )
             return
-        existing_task = await db.get_owner_subscribe_task(message.from_user.id, chat.id)
+        existing_task = await db.get_owner_subscribe_task(owner_id, chat.id)
         if existing_task:
             await message.answer(
                 "Этот канал/чат вы уже рекламировали.\n"
@@ -2515,7 +2540,7 @@ async def create_channel(
     )
     await state.set_state(CreateTaskState.reward)
     await message.answer(
-        await build_reward_prompt(db, state, config, message.from_user.id),
+        await build_reward_prompt(db, state, config, owner_id),
         reply_markup=cancel_kb(),
     )
 
@@ -2525,6 +2550,7 @@ async def create_channel_shared(
     message: Message, state: FSMContext, bot: Bot, db: Database, config: Config
 ) -> None:
     data = await state.get_data()
+    owner_id = resolve_create_owner_id(message.from_user.id, data, config)
     task_type = data.get("task_type")
     subscribe_kind = data.get("subscribe_kind")
     if task_type != "subscribe":
@@ -2587,7 +2613,7 @@ async def create_channel_shared(
     )
     await state.set_state(CreateTaskState.reward)
     await message.answer(
-        await build_reward_prompt(db, state, config, message.from_user.id),
+        await build_reward_prompt(db, state, config, owner_id),
         reply_markup=cancel_kb(),
     )
 
@@ -2616,13 +2642,14 @@ async def create_post(
         title=f"{title_prefix}: {chat_title}",
     )
     data = await state.get_data()
+    owner_id = resolve_create_owner_id(message.from_user.id, data, config)
     if data.get("task_type") == "reaction":
         await state.set_state(CreateTaskState.reaction)
         await message.answer("Выберите реакцию:", reply_markup=reaction_choices_kb())
         return
     await state.set_state(CreateTaskState.reward)
     await message.answer(
-        await build_reward_prompt(db, state, config, message.from_user.id),
+        await build_reward_prompt(db, state, config, owner_id),
         reply_markup=cancel_kb(),
     )
 
@@ -2633,9 +2660,11 @@ async def create_reaction(
 ) -> None:
     reaction = callback.data.split(":", 1)[1]
     await state.update_data(required_reaction=reaction)
+    data = await state.get_data()
+    owner_id = resolve_create_owner_id(callback.from_user.id, data, config)
     await state.set_state(CreateTaskState.reward)
     await callback.message.answer(
-        await build_reward_prompt(db, state, config, callback.from_user.id),
+        await build_reward_prompt(db, state, config, owner_id),
         reply_markup=cancel_kb(),
     )
     await callback.answer()
@@ -2651,6 +2680,7 @@ async def create_reward(
         await message.answer("Введите число.")
         return
     data = await state.get_data()
+    owner_id = resolve_create_owner_id(message.from_user.id, data, config)
     task_type = data.get("task_type")
     min_reward = min_reward_for(task_type, data.get("chat_type"), config)
     if reward < min_reward:
@@ -2658,14 +2688,18 @@ async def create_reward(
         return
     await state.update_data(reward=reward)
     await state.set_state(CreateTaskState.quantity)
-    user = await db.get_user(message.from_user.id)
+    user = await db.get_user(owner_id)
     balance = int(user["balance"]) if user else 0
     max_quantity = max_quantity_for_balance(balance, reward, config, user)
     await state.update_data(max_quantity=max_quantity)
+    owner_hint = ""
+    if owner_id != message.from_user.id:
+        owner_hint = f"\nВладелец: <code>{owner_id}</code>"
     await message.answer(
         "Введите количество выполнений:\n"
         f"Стоимость одного выполнения: <b>{format_coins(reward)}</b> BIT\n"
-        f"Баланс: <b>{format_coins(balance)}</b> BIT",
+        f"Баланс: <b>{format_coins(balance)}</b> BIT"
+        f"{owner_hint}",
         reply_markup=quantity_kb(max_quantity),
     )
 
@@ -2675,14 +2709,15 @@ async def create_quantity_max(
     callback: CallbackQuery, state: FSMContext, db: Database, config: Config
 ) -> None:
     data = await state.get_data()
+    owner_id = resolve_create_owner_id(callback.from_user.id, data, config)
     max_quantity = int(data.get("max_quantity") or 0)
     if max_quantity <= 0:
         await callback.answer("Недостаточно данных.", show_alert=True)
         return
-    user = await db.get_user(callback.from_user.id)
+    user = await db.get_user(owner_id)
     await handle_quantity_input(
         max_quantity,
-        callback.from_user.id,
+        owner_id,
         state,
         db,
         config,
@@ -2751,9 +2786,11 @@ async def create_quantity(
     except ValueError:
         await message.answer("Введите число.")
         return
+    data = await state.get_data()
+    owner_id = resolve_create_owner_id(message.from_user.id, data, config)
     await handle_quantity_input(
         quantity,
-        message.from_user.id,
+        owner_id,
         state,
         db,
         config,
@@ -2777,6 +2814,7 @@ async def create_confirm(
     callback: CallbackQuery, state: FSMContext, db: Database, config: Config
 ) -> None:
     data = await state.get_data()
+    owner_id = resolve_create_owner_id(callback.from_user.id, data, config)
     required = ("task_type", "title", "reward", "quantity")
     if any(key not in data for key in required):
         await state.clear()
@@ -2793,12 +2831,16 @@ async def create_confirm(
     chat_id=data.get("chat_id"),
     chat_username=data.get("chat_username"),
     source_message_id=data.get("source_message_id"),
-    owner_id=callback.from_user.id,
+    owner_id=owner_id,
     )
     if duplicate:
         builder = InlineKeyboardBuilder()
-        builder.button(text="✏️ Редактировать", callback_data=f"adv:task:{duplicate['id']}:1")
-        builder.button(text="⬅️ Назад", callback_data="menu:ads")
+        if owner_id == callback.from_user.id:
+            builder.button(text="✏️ Редактировать", callback_data=f"adv:task:{duplicate['id']}:1")
+            builder.button(text="⬅️ Назад", callback_data="menu:ads")
+        else:
+            builder.button(text="✏️ Открыть в админке", callback_data=f"admin:task:edit:{duplicate['id']}")
+            builder.button(text="⬅️ Админ", callback_data="menu:admin")
         builder.adjust(2)
         await callback.message.answer(
             f"⚠️ На этом канале/группе/посте уже существует задание!\n\n"
@@ -2813,12 +2855,12 @@ async def create_confirm(
     
     total_cost = int(data["reward"]) * int(data["quantity"])
     commission_fee = 0
-    user = await db.get_user(callback.from_user.id)
+    user = await db.get_user(owner_id)
     free_until = int(user.get("commission_free_until") or 0) if user else 0
     if free_until <= now_ts():
         commission_fee = math.ceil(total_cost * (config.commission_percent / 100))
     task_id = await db.create_task(
-        owner_id=callback.from_user.id,
+        owner_id=owner_id,
         task_type=data["task_type"],
         title=data["title"],
         description=None,
@@ -2839,10 +2881,13 @@ async def create_confirm(
         await state.clear()
         await callback.answer()
         return
-    await notify_new_achievements(callback.bot, db, callback.from_user.id)
+    await notify_new_achievements(callback.bot, db, owner_id)
     await state.clear()
+    owner_hint = ""
+    if owner_id != callback.from_user.id:
+        owner_hint = f"\nВладелец: <code>{owner_id}</code>"
     await callback.message.answer(
-        f"Задание создано. ID: <code>{task_id}</code>",
+        f"Задание создано. ID: <code>{task_id}</code>{owner_hint}",
         reply_markup=main_menu_kb(callback.from_user.id in config.admin_ids),
     )
     await callback.answer()
@@ -5056,6 +5101,46 @@ async def admin_tasks_manage_start(callback: CallbackQuery, state: FSMContext, c
     await state.set_state(AdminState.admin_user_id)
     await callback.message.answer("Введите ID пользователя для управления его заданиями:", reply_markup=cancel_kb())
     await callback.answer()
+
+
+@router.callback_query(F.data == "admin:create:as_user")
+async def admin_create_as_user_start(
+    callback: CallbackQuery, state: FSMContext, config: Config
+) -> None:
+    if not is_admin(callback.from_user.id, config):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    await state.set_state(AdminState.admin_create_task_owner)
+    await callback.message.answer(
+        "Введите ID пользователя, от имени которого нужно создать задание:",
+        reply_markup=cancel_kb(),
+    )
+    await callback.answer()
+
+
+@router.message(AdminState.admin_create_task_owner)
+async def admin_create_as_user_owner(
+    message: Message, state: FSMContext, db: Database, config: Config
+) -> None:
+    if not is_admin(message.from_user.id, config):
+        return
+    try:
+        owner_id = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("Введите числовой ID пользователя.")
+        return
+    user = await db.get_user(owner_id)
+    if not user:
+        await message.answer("Пользователь не найден в базе. Сначала он должен запустить бота.")
+        return
+    await start_create_flow(
+        message.bot,
+        message.from_user.id,
+        state,
+        db,
+        owner_id=owner_id,
+    )
+
 
 @router.callback_query(F.data.startswith("admin:task:block:"))
 async def admin_task_block_start(callback: CallbackQuery, state: FSMContext, config: Config) -> None:
